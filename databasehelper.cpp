@@ -38,6 +38,7 @@ void DatabaseHelper::initializeDatabase()
     query.exec("ALTER TABLE CustomShapes ADD COLUMN TemplateMaskPath TEXT;");
     query.exec("ALTER TABLE CustomShapes ADD COLUMN ContourData TEXT;");
     query.exec("ALTER TABLE CustomShapes ADD COLUMN RefAngle REAL DEFAULT 0;");
+    query.exec("ALTER TABLE CustomShapes ADD COLUMN SnapToEdge INTEGER DEFAULT 0;");
 }
 
 void DatabaseHelper::saveShape(const ShapeData &shape)

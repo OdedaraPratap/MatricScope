@@ -93,10 +93,20 @@ void CameraWorker::stop() {
 }
 
 void CameraWorker::setMode(MeasurementMode mode) {
-    QMutexLocker locker(&m_mutex);
-    m_mode = mode;
+    {
+        QMutexLocker locker(&m_mutex);
+        m_mode = mode;
+    }
     qDebug() << "DEBUG: MeasurementMode changed to:" << static_cast<int>(mode);
     resetSnapshotState();
+}
+
+void CameraWorker::setActiveCustomShape(const ShapeData &shape) {
+    QMutexLocker locker(&m_mutex);
+    m_activeCustomShape = shape;
+    m_hasMeasuredCurrentObject = false;
+    m_stableFrameCount = 0;
+    m_isRenderingSnapshot = false;
 }
 
 void CameraWorker::captureBackground() {
@@ -1183,16 +1193,10 @@ void CameraWorker::getInvariantTransform(const std::vector<cv::Point>& hull, cv:
     centroid = cv::Point2f(mu.m10 / mu.m00, mu.m01 / mu.m00);
     scale = std::max(1.0f, static_cast<float>(std::sqrt(std::abs(mu.m00))));
 
-    double theta = 0.0;
-    if (std::abs(mu.mu20 - mu.mu02) < 1e-2 && std::abs(mu.mu11) < 1e-2) {
-        double maxR = 0;
-        for (auto pt : hull) {
-            double r2 = std::pow(pt.x - centroid.x, 2) + std::pow(pt.y - centroid.y, 2);
-            if (r2 > maxR) { maxR = r2; theta = std::atan2(pt.y - centroid.y, pt.x - centroid.x); }
-        }
-    } else {
-        theta = 0.5 * std::atan2(2 * mu.mu11, mu.mu20 - mu.mu02);
-    }
+    // The principal (long) axis is substantially more stable than choosing an
+    // axis from small contour asymmetries.  The old asymmetry test could jump by
+    // 90 degrees between otherwise identical frames and interchange L and W.
+    double theta = 0.5 * std::atan2(2 * mu.mu11, mu.mu20 - mu.mu02);
 
     double dx = std::cos(theta), dy = std::sin(theta);
     double nx = -dy, ny = dx;
@@ -1205,22 +1209,13 @@ void CameraWorker::getInvariantTransform(const std::vector<cv::Point>& hull, cv:
         if (p2 > maxP2) maxP2 = p2; if (p2 < minP2) minP2 = p2;
     }
 
-    double span1 = maxP1 - minP1;
-    double span2 = maxP2 - minP2;
-    double asym1 = std::abs(std::abs(maxP1) - std::abs(minP1));
-    double asym2 = std::abs(std::abs(maxP2) - std::abs(minP2));
+    if ((maxP2 - minP2) > (maxP1 - minP1)) theta += CV_PI / 2.0;
 
-    if (std::max(asym1, asym2) > 0.05 * scale) {
-        if (asym2 > asym1) {
-            theta += CV_PI / 2.0;
-        }
-        if (std::abs(minP1) > std::abs(maxP1)) theta += CV_PI;
-    } else {
-        if (span2 > span1) theta += CV_PI / 2.0;
-        double finalDx = std::cos(theta);
-        double finalDy = std::sin(theta);
-        if (finalDy > 0.001 || (std::abs(finalDy) <= 0.001 && finalDx < 0)) theta += CV_PI;
-    }
+    // Resolve only the harmless 180-degree ambiguity.  Never select the
+    // perpendicular axis based on asymmetry: that is what caused axis swaps.
+    const double finalDx = std::cos(theta);
+    const double finalDy = std::sin(theta);
+    if (finalDy > 0.001 || (std::abs(finalDy) <= 0.001 && finalDx < 0)) theta += CV_PI;
 
     while (theta < 0) theta += 2 * CV_PI;
     while (theta >= 2 * CV_PI) theta -= 2 * CV_PI;
@@ -1341,8 +1336,14 @@ QString CameraWorker::measurePolygon(cv::Mat &src) {
 // CUSTOM SHAPE ENGINE
 // ============================================================================
 QString CameraWorker::measureCustom(cv::Mat &src) {
-    if (m_activeCustomShape.Name.isEmpty()) return "Error: No Active Shape Selected";
+    ShapeData activeShape;
+    {
+        QMutexLocker locker(&m_mutex);
+        activeShape = m_activeCustomShape;
+    }
+    if (activeShape.Name.isEmpty()) return "Error: No Active Shape Selected";
     double ppm = getPpm();
+    if (!std::isfinite(ppm) || ppm <= 0.0) return "Please Calibrate";
     if (!ensureBgr8(src)) return "Error: Unsupported image format";
     cv::Mat gray, edges;
     cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
@@ -1356,8 +1357,20 @@ QString CameraWorker::measureCustom(cv::Mat &src) {
     cv::findContours(edges, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
     if (contours.empty()) return "Object not present";
-    const auto &largestContour = *std::max_element(contours.begin(), contours.end(),
-        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
+    auto bestContour = contours.end();
+    double bestArea = 0.0;
+    for (auto it = contours.begin(); it != contours.end(); ++it) {
+        const cv::Rect bounds = cv::boundingRect(*it);
+        const bool touchesFrame = bounds.x <= 2 || bounds.y <= 2 ||
+            bounds.br().x >= src.cols - 2 || bounds.br().y >= src.rows - 2;
+        const double area = cv::contourArea(*it);
+        if (!touchesFrame && area > bestArea) {
+            bestArea = area;
+            bestContour = it;
+        }
+    }
+    if (bestContour == contours.end()) return "Object not present";
+    const auto &largestContour = *bestContour;
 
     if (cv::contourArea(largestContour) < 1200) return "Object not present";
 
@@ -1369,20 +1382,28 @@ QString CameraWorker::measureCustom(cv::Mat &src) {
     float liveScale;
     getInvariantTransform(liveHull, liveCenter, liveAngle, liveScale);
 
-    cv::Point2f calcW1 = projectToScreen(m_activeCustomShape.WidthPt1, liveCenter, liveAngle, liveScale);
-    cv::Point2f calcW2 = projectToScreen(m_activeCustomShape.WidthPt2, liveCenter, liveAngle, liveScale);
-    cv::Point2f calcL1 = projectToScreen(m_activeCustomShape.LengthPt1, liveCenter, liveAngle, liveScale);
-    cv::Point2f calcL2 = projectToScreen(m_activeCustomShape.LengthPt2, liveCenter, liveAngle, liveScale);
+    cv::Point2f calcW1 = projectToScreen(activeShape.WidthPt1, liveCenter, liveAngle, liveScale);
+    cv::Point2f calcW2 = projectToScreen(activeShape.WidthPt2, liveCenter, liveAngle, liveScale);
+    cv::Point2f calcL1 = projectToScreen(activeShape.LengthPt1, liveCenter, liveAngle, liveScale);
+    cv::Point2f calcL2 = projectToScreen(activeShape.LengthPt2, liveCenter, liveAngle, liveScale);
 
-    if (m_activeCustomShape.SnapToEdge) {
-        calcW1 = snapToEdgeStraight(liveCenter, calcW1, liveHull);
-        calcW2 = snapToEdgeStraight(liveCenter, calcW2, liveHull);
-        calcL1 = snapToEdgeStraight(liveCenter, calcL1, liveHull);
-        calcL2 = snapToEdgeStraight(liveCenter, calcL2, liveHull);
+    if (activeShape.SnapToEdge) {
+        // Intersect the complete annotated chord with the outline.  Radial rays
+        // from the centroid are incorrect for measurements that are off-centre.
+        snapLineToContour(calcW1, calcW2, liveHull);
+        snapLineToContour(calcL1, calcL2, liveHull);
     }
 
     double lengthVal = std::hypot(calcL1.x - calcL2.x, calcL1.y - calcL2.y) / ppm;
     double widthVal = std::hypot(calcW1.x - calcW2.x, calcW1.y - calcW2.y) / ppm;
+
+    // Length is the larger named dimension.  This also protects nearly square
+    // profiles whose principal axis can legitimately be ambiguous.
+    if (widthVal > lengthVal) {
+        std::swap(widthVal, lengthVal);
+        std::swap(calcW1, calcL1);
+        std::swap(calcW2, calcL2);
+    }
 
     cv::line(src, calcW1, calcW2, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
     cv::line(src, calcL1, calcL2, cv::Scalar(255, 0, 0), 2, cv::LINE_AA);
@@ -1400,6 +1421,34 @@ QString CameraWorker::measureCustom(cv::Mat &src) {
 
     cv::imwrite("CUSTOMS.png", src);
     return QString("Length: %1\nWidth: %2").arg(lengthVal, 0, 'f', 2).arg(widthVal, 0, 'f', 2);
+}
+
+bool CameraWorker::snapLineToContour(cv::Point2f &point1, cv::Point2f &point2,
+                                     const std::vector<cv::Point>& contour) const {
+    const cv::Point2f delta = point2 - point1;
+    const float length = cv::norm(delta);
+    if (length <= 1e-4f || contour.size() < 2) return false;
+
+    const cv::Point2f direction = delta * (1.0f / length);
+    float minimum = std::numeric_limits<float>::max();
+    float maximum = std::numeric_limits<float>::lowest();
+    for (size_t index = 0; index < contour.size(); ++index) {
+        const cv::Point2f start(contour[index]);
+        const cv::Point2f segment = cv::Point2f(contour[(index + 1) % contour.size()]) - start;
+        const float cross = direction.x * segment.y - direction.y * segment.x;
+        if (std::abs(cross) <= 1e-6f) continue;
+        const cv::Point2f offset = start - point1;
+        const float linePosition = (offset.x * segment.y - offset.y * segment.x) / cross;
+        const float segmentPosition = (offset.x * direction.y - offset.y * direction.x) / cross;
+        if (segmentPosition >= -1e-4f && segmentPosition <= 1.0001f) {
+            minimum = std::min(minimum, linePosition);
+            maximum = std::max(maximum, linePosition);
+        }
+    }
+    if (minimum == std::numeric_limits<float>::max() || maximum - minimum <= 1e-4f) return false;
+    point2 = point1 + direction * maximum;
+    point1 += direction * minimum;
+    return true;
 }
 
 cv::Point2f CameraWorker::projectToScreen(cv::Point2f localPt, cv::Point2f centroid, double angle, float scale) {

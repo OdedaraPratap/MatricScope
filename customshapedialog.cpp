@@ -40,6 +40,7 @@ CustomShapeDialog::CustomShapeDialog(const cv::Mat &capturedFrame, QWidget *pare
     btnSetWidth = new QPushButton("1. Set Width (2 Clicks)", this);
     btnSetLength = new QPushButton("2. Set Length (2 Clicks)", this);
     chkSnapToEdge = new QCheckBox("Snap to Edge", this);
+    chkSnapToEdge->setChecked(true);
     btnResetZoom = new QPushButton("Reset Zoom", this);
     btnSave = new QPushButton("3. Save Shape", this);
     lblStatus = new QLabel("Status: Select Width or Length mode.", this);
@@ -106,12 +107,16 @@ void CustomShapeDialog::detectBaseOrientation()
 }
 
 void CustomShapeDialog::onSetWidthClicked() {
+    m_hasW1 = false;
+    m_hasW2 = false;
     m_currentState = ClickState::Width;
     lblStatus->setText("Click 2 points for WIDTH on the image.");
     setCursor(Qt::CrossCursor);
 }
 
 void CustomShapeDialog::onSetLengthClicked() {
+    m_hasL1 = false;
+    m_hasL2 = false;
     m_currentState = ClickState::Length;
     lblStatus->setText("Click 2 points for LENGTH on the image.");
     setCursor(Qt::CrossCursor);
@@ -242,6 +247,14 @@ void CustomShapeDialog::onSaveClicked() {
         return;
     }
 
+    const double selectedWidth = cv::norm(m_w2 - m_w1);
+    const double selectedLength = cv::norm(m_l2 - m_l1);
+    if (selectedWidth < 2.0 || selectedLength < 2.0) {
+        QMessageBox::warning(this, "Invalid Measurement",
+                             "Width and length lines must each contain two different points.");
+        return;
+    }
+
     bool ok;
     QString shapeName = QInputDialog::getText(this, "Save Shape", "Enter Custom Shape Name:", QLineEdit::Normal, "NewShape", &ok);
     if (!ok || shapeName.trimmed().isEmpty()) return;
@@ -259,10 +272,20 @@ void CustomShapeDialog::onSaveClicked() {
 
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(edges, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-    auto largest = std::max_element(contours.begin(), contours.end(),
-        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
+    auto largest = contours.end();
+    double largestArea = 0.0;
+    for (auto it = contours.begin(); it != contours.end(); ++it) {
+        const cv::Rect bounds = cv::boundingRect(*it);
+        const bool touchesFrame = bounds.x <= 2 || bounds.y <= 2 ||
+            bounds.br().x >= m_sourceFrame.cols - 2 || bounds.br().y >= m_sourceFrame.rows - 2;
+        const double area = cv::contourArea(*it);
+        if (!touchesFrame && area > largestArea) {
+            largestArea = area;
+            largest = it;
+        }
+    }
 
-    if (largest == contours.end()) {
+    if (largest == contours.end() || largestArea < 1200.0) {
         QMessageBox::warning(this, "Error", "Error detecting stone outline for training.");
         return;
     }
@@ -272,6 +295,10 @@ void CustomShapeDialog::onSaveClicked() {
 
     CameraWorker worker;
     worker.getInvariantTransform(hull, refCenter, refAngle, uniformScale);
+    if (!std::isfinite(uniformScale) || uniformScale <= 0.0f) {
+        QMessageBox::warning(this, "Error", "The detected stone outline is invalid. Please capture it again.");
+        return;
+    }
 
     QString recordsFolder = QDir::currentPath() + "/CustomShapes";
     QDir().mkpath(recordsFolder);
