@@ -31,9 +31,12 @@ MainWindow::MainWindow(QWidget *parent)
     populateCustomShapesMenu();
 
     m_cameraWorker = new CameraWorker(this);
-        connect(m_cameraWorker, &CameraWorker::frameReady, this, &MainWindow::updateCameraFeed);
-        connect(m_cameraWorker, &CameraWorker::measurementResult, this, &MainWindow::handleMeasurement);
-        connect(m_cameraWorker, &CameraWorker::statusUpdated, this, &MainWindow::updateMeasurementUI);
+    connect(m_cameraWorker, &CameraWorker::frameReady,
+            this, &MainWindow::updateCameraFeed, Qt::QueuedConnection);
+    connect(m_cameraWorker, &CameraWorker::measurementResult,
+            this, &MainWindow::handleMeasurement, Qt::QueuedConnection);
+    connect(m_cameraWorker, &CameraWorker::statusUpdated,
+            this, &MainWindow::updateMeasurementUI, Qt::QueuedConnection);
     m_cameraWorker->start();
 }
 

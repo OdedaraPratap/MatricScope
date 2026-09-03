@@ -6,9 +6,6 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QSqlDatabase>
-#include <QSqlQuery>
-#include <QSqlError>
 #include <QSettings>
 #include <cmath>
 #include <algorithm>

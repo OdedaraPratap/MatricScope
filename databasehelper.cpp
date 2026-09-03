@@ -4,18 +4,50 @@
 #include <QSqlError>
 #include <QDebug>
 #include <QDir>
+#include <QCoreApplication>
+#include <QThread>
+
+namespace {
+
+QSqlDatabase databaseForCurrentThread()
+{
+    const bool isApplicationThread = QCoreApplication::instance() &&
+        QThread::currentThread() == QCoreApplication::instance()->thread();
+    const QString connectionName = isApplicationThread
+        ? QStringLiteral("qt_sql_default_connection")
+        : QStringLiteral("MatricScopeWorker_%1")
+              .arg(reinterpret_cast<quintptr>(QThread::currentThreadId()), 0, 16);
+
+    QSqlDatabase db = QSqlDatabase::contains(connectionName)
+        ? QSqlDatabase::database(connectionName)
+        : QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName);
+
+    if (db.databaseName().isEmpty()) {
+        db.setDatabaseName(QDir::current().absoluteFilePath(QStringLiteral("History.db")));
+    }
+    if (!db.isOpen() && !db.open()) {
+        qWarning() << "Could not open database connection" << connectionName
+                   << db.lastError().text();
+        return db;
+    }
+
+    QSqlQuery configure(db);
+    configure.exec(QStringLiteral("PRAGMA busy_timeout = 5000;"));
+    return db;
+}
+
+} // namespace
 
 void DatabaseHelper::initializeDatabase()
 {
-    QSqlDatabase db = QSqlDatabase::addDatabase("QSQLITE");
-    db.setDatabaseName("History.db");
-
-    if (!db.open()) {
+    QSqlDatabase db = databaseForCurrentThread();
+    if (!db.isOpen()) {
         qDebug() << "Error: Failed to connect database." << db.lastError().text();
         return;
     }
 
-    QSqlQuery query;
+    QSqlQuery query(db);
+    query.exec(QStringLiteral("PRAGMA journal_mode = WAL;"));
     QString sql = R"(
         CREATE TABLE IF NOT EXISTS CustomShapes (
             Id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,14 +75,10 @@ void DatabaseHelper::initializeDatabase()
 
 void DatabaseHelper::saveShape(const ShapeData &shape)
 {
-    QSqlDatabase db = QSqlDatabase::database();
-    if (!db.isOpen()) {
-        db = QSqlDatabase::addDatabase("QSQLITE");
-        db.setDatabaseName("History.db");
-        db.open();
-    }
+    QSqlDatabase db = databaseForCurrentThread();
+    if (!db.isOpen()) return;
 
-    QSqlQuery query;
+    QSqlQuery query(db);
     query.prepare(R"(
         INSERT INTO CustomShapes (Name, ImagePath, W1X, W1Y, W2X, W2Y, L1X, L1Y, L2X, L2Y, RefAngle, ContourData, TemplateMaskPath, SnapToEdge)
         VALUES (:Name, :ImagePath, :W1X, :W1Y, :W2X, :W2Y, :L1X, :L1Y, :L2X, :L2Y, :RefAngle, :ContourData, :TemplateMaskPath, :SnapToEdge);
@@ -79,14 +107,10 @@ void DatabaseHelper::saveShape(const ShapeData &shape)
 QVector<ShapeData> DatabaseHelper::getAllShapes()
 {
     QVector<ShapeData> list;
-    QSqlDatabase db = QSqlDatabase::database();
-    if (!db.isOpen()) {
-        db = QSqlDatabase::addDatabase("QSQLITE");
-        db.setDatabaseName("History.db");
-        db.open();
-    }
+    QSqlDatabase db = databaseForCurrentThread();
+    if (!db.isOpen()) return list;
 
-    QSqlQuery query("SELECT * FROM CustomShapes;");
+    QSqlQuery query(QStringLiteral("SELECT * FROM CustomShapes;"), db);
     while (query.next()) {
         ShapeData shape;
         shape.Id = query.value("Id").toInt();
@@ -108,14 +132,10 @@ QVector<ShapeData> DatabaseHelper::getAllShapes()
 
 void DatabaseHelper::deleteShape(int shapeId)
 {
-    QSqlDatabase db = QSqlDatabase::database();
-    if (!db.isOpen()) {
-        db = QSqlDatabase::addDatabase("QSQLITE");
-        db.setDatabaseName("History.db");
-        db.open();
-    }
+    QSqlDatabase db = databaseForCurrentThread();
+    if (!db.isOpen()) return;
 
-    QSqlQuery query;
+    QSqlQuery query(db);
     query.prepare("DELETE FROM CustomShapes WHERE Id = :Id;");
     query.bindValue(":Id", shapeId);
     if (!query.exec()) {
