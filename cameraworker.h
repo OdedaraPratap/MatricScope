@@ -37,6 +37,7 @@ public:
 
     void stop();
     void setMode(MeasurementMode mode);
+    void setActiveCustomShape(const ShapeData &shape);
     void captureBackground();
     void setPpm(double ppmValue);
     cv::Mat getLatestFrame();
@@ -83,6 +84,8 @@ private:
 
     cv::Point2f projectToScreen(cv::Point2f localPt, cv::Point2f centroid, double angle, float scale);
     cv::Point2f snapToEdgeStraight(cv::Point2f center, cv::Point2f targetPt, const std::vector<cv::Point>& contour);
+    bool snapLineToContour(cv::Point2f &point1, cv::Point2f &point2,
+                           const std::vector<cv::Point>& contour) const;
 
     QMutex m_mutex;
     bool m_running;
