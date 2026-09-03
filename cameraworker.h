@@ -5,6 +5,8 @@
 #include <QImage>
 #include <QString>
 #include <QElapsedTimer>
+#include <QFuture>
+#include <atomic>
 #include <opencv2/opencv.hpp>
 #include "MvCameraControl.h"
 
@@ -84,6 +86,8 @@ private:
 
     QMutex m_mutex;
     bool m_running;
+    std::atomic_bool m_processingFrame{false};
+    QFuture<void> m_processingFuture;
     MeasurementMode m_mode;
     double m_ppm;
     int m_thresholdValue;

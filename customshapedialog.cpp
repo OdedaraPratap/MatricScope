@@ -13,8 +13,19 @@
 CustomShapeDialog::CustomShapeDialog(const cv::Mat &capturedFrame, QWidget *parent)
     : QDialog(parent), m_currentState(ClickState::None), m_zoomFactor(1.0f), m_isPanning(false)
 {
-    m_sourceFrame = capturedFrame.clone();
-    m_displayFrame = capturedFrame.clone();
+    if (!capturedFrame.empty() && capturedFrame.depth() == CV_8U) {
+        if (capturedFrame.channels() == 1) {
+            cv::cvtColor(capturedFrame, m_sourceFrame, cv::COLOR_GRAY2BGR);
+        } else if (capturedFrame.channels() == 3) {
+            m_sourceFrame = capturedFrame.clone();
+        } else if (capturedFrame.channels() == 4) {
+            cv::cvtColor(capturedFrame, m_sourceFrame, cv::COLOR_BGRA2BGR);
+        }
+    }
+    if (m_sourceFrame.empty()) {
+        m_sourceFrame = cv::Mat(480, 640, CV_8UC3, cv::Scalar::all(0));
+    }
+    m_displayFrame = m_sourceFrame.clone();
 
     setWindowTitle("Custom Shape Trainer (Affine Mapping)");
     resize(1100, 720);
@@ -65,9 +76,6 @@ CustomShapeDialog::CustomShapeDialog(const cv::Mat &capturedFrame, QWidget *pare
 void CustomShapeDialog::detectBaseOrientation()
 {
     cv::Mat gray, edges;
-    if (m_sourceFrame.channels() == 1) {
-            cv::cvtColor(m_sourceFrame, m_sourceFrame, cv::COLOR_GRAY2BGR);
-    }
     cv::cvtColor(m_sourceFrame, gray, cv::COLOR_BGR2GRAY);
     cv::medianBlur(gray, gray, 5);
     cv::Canny(gray, edges, 40, 120);
@@ -189,10 +197,6 @@ void CustomShapeDialog::wheelEvent(QWheelEvent *event) {
 
 void CustomShapeDialog::redrawOverlay() {
     m_displayFrame = m_sourceFrame.clone();
-
-    if (m_displayFrame.channels() == 1) {
-            cv::cvtColor(m_displayFrame, m_displayFrame, cv::COLOR_GRAY2BGR);
-    }
 
     cv::circle(m_displayFrame, m_centroid, 5, cv::Scalar(0, 255, 255), -1);
 
