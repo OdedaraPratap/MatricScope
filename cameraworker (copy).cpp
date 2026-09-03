@@ -1,0 +1,1323 @@
+#include "cameraworker.h"
+#include <QDebug>
+#include <QRegularExpression>
+#include <QRegularExpressionMatchIterator>
+#include <QDateTime>
+#include <QFile>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QSqlDatabase>
+#include <QSqlQuery>
+#include <QSqlError>
+#include <QSettings>
+#include <cmath>
+#include <algorithm>
+#include <cstdlib>
+
+CameraWorker::CameraWorker(QObject *parent)
+    : QThread(parent), m_running(true), m_mode(MeasurementMode::None),
+      m_ppm(100.0), m_thresholdValue(25), m_lastCentroid(0, 0),
+      m_stableFrameCount(0), m_hasMeasuredCurrentObject(false), m_devHandle(nullptr)
+{
+    qDebug() << "DEBUG: CameraWorker constructor called.";
+    m_backgroundGray = cv::imread("Blank_Bg.png", cv::IMREAD_GRAYSCALE);
+    if (!m_backgroundGray.empty()) {
+        cv::medianBlur(m_backgroundGray, m_backgroundGray, 7);
+        qDebug() << "DEBUG: Blank_Bg.png loaded successfully.";
+    } else {
+        qDebug() << "DEBUG: Warning - Blank_Bg.png could not be loaded or is empty.";
+    }
+}
+
+CameraWorker::~CameraWorker() {
+    qDebug() << "DEBUG: CameraWorker destructor called.";
+    stop();
+}
+
+void CameraWorker::stop() {
+    qDebug() << "DEBUG: stop() called on CameraWorker.";
+    {
+        QMutexLocker locker(&m_mutex);
+        m_running = false;
+    }
+    wait();
+    qDebug() << "DEBUG: CameraWorker thread successfully stopped and joined.";
+}
+
+void CameraWorker::setMode(MeasurementMode mode) {
+    QMutexLocker locker(&m_mutex);
+    m_mode = mode;
+    qDebug() << "DEBUG: MeasurementMode changed to:" << static_cast<int>(mode);
+    resetSnapshotState();
+}
+
+void CameraWorker::captureBackground() {
+    QMutexLocker locker(&m_mutex);
+    m_captureFlag = true;
+    qDebug() << "DEBUG: Background capture requested.";
+}
+
+void CameraWorker::setPpm(double ppmValue) {
+    QMutexLocker locker(&m_mutex);
+    m_ppm = (ppmValue > 0) ? ppmValue : 1.0;
+    qDebug() << "DEBUG: PPM updated to:" << m_ppm;
+}
+
+void CameraWorker::resetSnapshotState() {
+    m_stableFrameCount = 0;
+    m_hasMeasuredCurrentObject = false;
+    m_lastCentroid = cv::Point(0, 0);
+    emit statusUpdated("Waiting for object...");
+}
+
+cv::Mat CameraWorker::getLatestFrame() {
+    QMutexLocker locker(&m_mutex);
+    if (m_latestFrame.empty()) {
+        qDebug() << "DEBUG: getLatestFrame() called, but m_latestFrame is empty!";
+    }
+    return m_latestFrame.clone();
+}
+
+void CameraWorker::updateCameraSettings(int exposure, int gain, int gamma) {
+    QMutexLocker locker(&m_mutex);
+    qDebug() << "DEBUG: updateCameraSettings called -> Exposure:" << exposure << "Gain:" << gain << "Gamma:" << gamma;
+
+    QSettings settings("MetricScope", "Settings");
+    settings.setValue("trackBarExposure1", exposure);
+    settings.setValue("trackBarGainMaster1", gain);
+    settings.setValue("trackBarGamma", gamma);
+
+    m_currentExposure = exposure;
+    m_currentGain = gain;
+    m_currentGamma = gamma;
+    m_settingsChanged = true;
+
+    if (m_devHandle) {
+        int nRetExp = MV_CC_SetFloatValue(m_devHandle, "ExposureTime", m_currentExposure);
+        int nRetGain = MV_CC_SetFloatValue(m_devHandle, "Gain", m_currentGain);
+        qDebug() << "DEBUG: Set camera settings SDK return codes -> Exposure:" << nRetExp << "Gain:" << nRetGain;
+    } else {
+        qDebug() << "DEBUG: Warning - m_devHandle is NULL while updating settings.";
+    }
+}
+
+void CameraWorker::run() {
+    qDebug() << "DEBUG: CameraWorker thread run() started.";
+    int nRet = MV_OK;
+
+    // 1. Enumerate Devices
+    MV_CC_DEVICE_INFO_LIST stDeviceList;
+    memset(&stDeviceList, 0, sizeof(MV_CC_DEVICE_INFO_LIST));
+    nRet = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &stDeviceList);
+    if (nRet != MV_OK || stDeviceList.nDeviceNum == 0) {
+        qDebug() << "DEBUG: Error - No Hikrobot Camera Found. EnumDevices return:" << nRet << "Count:" << stDeviceList.nDeviceNum;
+        emit statusUpdated("Error: No Hikrobot Camera Found.");
+        return;
+    }
+    qDebug() << "DEBUG: Hikrobot camera(s) found count:" << stDeviceList.nDeviceNum;
+
+    // 2. Create Handle for the first device
+    nRet = MV_CC_CreateHandle(&m_devHandle, stDeviceList.pDeviceInfo[0]);
+    if (nRet != MV_OK || !m_devHandle) {
+        qDebug() << "DEBUG: Error - Failed to create Hikrobot handle. Return:" << nRet;
+        emit statusUpdated("Error: Failed to create Hikrobot handle.");
+        return;
+    }
+    qDebug() << "DEBUG: Hikrobot handle created successfully.";
+
+    // 3. Open Device
+    nRet = MV_CC_OpenDevice(m_devHandle);
+    if (nRet != MV_OK) {
+        qDebug() << "DEBUG: Error - Failed to open Hikrobot camera. Return:" << nRet;
+        emit statusUpdated("Error: Failed to open Hikrobot camera.");
+        MV_CC_DestroyHandle(m_devHandle);
+        m_devHandle = nullptr;
+        return;
+    }
+    qDebug() << "DEBUG: Hikrobot camera opened successfully.";
+
+    // 4. Set Trigger Mode to Off (Continuous Frame Grabbing)
+    nRet = MV_CC_SetEnumValue(m_devHandle, "TriggerMode", 0);
+    qDebug() << "DEBUG: Set TriggerMode to Off. Return:" << nRet;
+
+    // 5. Apply Initial Settings from QSettings
+    QSettings settings("MetricScope", "Settings");
+    double initialExposure = settings.value("trackBarExposure1", 10000.0).toDouble();
+    double initialGain = settings.value("trackBarGainMaster1", 10.0).toDouble();
+    qDebug() << "DEBUG: Applying initial settings -> Exposure:" << initialExposure << "Gain:" << initialGain;
+
+    MV_CC_SetEnumValue(m_devHandle, "ExposureAuto", 0);
+    MV_CC_SetEnumValue(m_devHandle, "GainAuto", 0);
+
+    MV_CC_SetFloatValue(m_devHandle, "ExposureTime", initialExposure);
+    MV_CC_SetFloatValue(m_devHandle, "Gain", initialGain);
+
+    // 6. Register Continuous Callback Hook
+    nRet = MV_CC_RegisterImageCallBackEx(m_devHandle, ImageCallBackEx, this);
+    if (nRet != MV_OK) {
+        qDebug() << "DEBUG: Error - Failed to register camera callback. Return:" << nRet;
+        emit statusUpdated("Error: Failed to register camera callback.");
+    } else {
+        qDebug() << "DEBUG: Image callback registered successfully.";
+    }
+
+    // 7. Start Grabbing Frames
+    nRet = MV_CC_StartGrabbing(m_devHandle);
+    if (nRet != MV_OK) {
+        qDebug() << "DEBUG: Error - Failed to start grabbing. Return:" << nRet;
+        emit statusUpdated("Error: Failed to start grabbing.");
+    } else {
+        qDebug() << "DEBUG: Hikrobot Camera Streaming started successfully.";
+        emit statusUpdated("Hikrobot Camera Streaming...");
+    }
+
+    // Keep thread alive while running
+    while (true) {
+        {
+            QMutexLocker locker(&m_mutex);
+            if (!m_running) {
+                qDebug() << "DEBUG: Stop flag caught in run loop. Exiting thread loop.";
+                break;
+            }
+
+            if (m_settingsChanged) {
+                MV_CC_SetFloatValue(m_devHandle, "ExposureTime", m_currentExposure);
+                MV_CC_SetFloatValue(m_devHandle, "Gain", m_currentGain);
+                m_settingsChanged = false;
+                qDebug() << "DEBUG: Applied deferred camera settings update.";
+            }
+        }
+        QThread::msleep(100);
+    }
+
+    // Cleanup Device
+    if (m_devHandle) {
+        qDebug() << "DEBUG: Cleaning up camera device handles...";
+        MV_CC_StopGrabbing(m_devHandle);
+        MV_CC_CloseDevice(m_devHandle);
+        MV_CC_DestroyHandle(m_devHandle);
+        m_devHandle = nullptr;
+        qDebug() << "DEBUG: Camera cleanup completed.";
+    }
+}
+
+// Static SDK Callback Trampoline
+void __stdcall CameraWorker::ImageCallBackEx(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFrameInfo, void *pUser) {
+    CameraWorker *pWorker = static_cast<CameraWorker*>(pUser);
+    if (pWorker) {
+        pWorker->handleFrame(pData, pFrameInfo);
+    }
+}
+
+// Frame Processing Callback Worker
+void CameraWorker::handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFrameInfo) {
+    if (!pData || !pFrameInfo) {
+        qDebug() << "DEBUG: handleFrame received NULL pData or pFrameInfo!";
+        return;
+    }
+
+    cv::Mat matImage;
+
+    // Convert Pixel Buffer Formats to OpenCV Mat
+    if (pFrameInfo->enPixelType == PixelType_Gvsp_Mono8) {
+        matImage = cv::Mat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC1, pData).clone();
+    }
+    else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerRG8 ||
+             pFrameInfo->enPixelType == PixelType_Gvsp_BayerGB8 ||
+             pFrameInfo->enPixelType == PixelType_Gvsp_BayerBG8) {
+        cv::Mat bayerMat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC1, pData);
+        int cvBayerCode = cv::COLOR_BayerRG2BGR;
+        if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerGB8) cvBayerCode = cv::COLOR_BayerGB2BGR;
+        else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerBG8) cvBayerCode = cv::COLOR_BayerBG2BGR;
+        cv::cvtColor(bayerMat, matImage, cvBayerCode);
+    }
+    else if (pFrameInfo->enPixelType == PixelType_Gvsp_RGB8_Packed) {
+        matImage = cv::Mat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC3, pData).clone();
+        cv::cvtColor(matImage, matImage, cv::COLOR_RGB2BGR);
+    }
+    else {
+        qDebug() << "DEBUG: Unhandled pixel type received from camera callback:" << pFrameInfo->enPixelType;
+        return;
+    }
+
+    if (matImage.empty()) {
+        qDebug() << "DEBUG: matImage conversion resulted in an empty matrix!";
+        return;
+    }
+
+    cv::Mat grayFrame;
+    if (matImage.channels() == 3) {
+        cv::cvtColor(matImage, grayFrame, cv::COLOR_BGR2GRAY);
+    } else {
+        grayFrame = matImage.clone();
+        cv::cvtColor(grayFrame, matImage, cv::COLOR_GRAY2BGR);
+    }
+
+    {
+        QMutexLocker locker(&m_mutex);
+        m_latestFrame = matImage.clone();
+
+        if (m_captureFlag) {
+            cv::imwrite("Blank_Bg.png", matImage);
+            m_backgroundGray = grayFrame.clone();
+            cv::medianBlur(m_backgroundGray, m_backgroundGray, 7);
+            m_captureFlag = false;
+            qDebug() << "DEBUG: Blank background captured and saved.";
+            emit statusUpdated("Background Captured!");
+        }
+
+        if (m_calibrationFlag) {
+            cv::Mat calibCopy = matImage.clone();
+            doCalibration(calibCopy);
+            m_calibrationFlag = false;
+        }
+
+        if (!m_backgroundGray.empty() && m_mode != MeasurementMode::None) {
+            processFrame(matImage);
+        }
+    }
+
+    QImage qimg = matToQImage(matImage);
+    if (qimg.isNull()) {
+        qDebug() << "DEBUG: matToQImage returned a null QImage!";
+    } else {
+        emit frameReady(qimg);
+    }
+}
+void CameraWorker::doCalibration(cv::Mat &src)
+{
+    if (src.empty()) return;
+
+    QSettings settings("MetricScope", "Settings");
+    double physicalDiameter = settings.value("calibval", 10.0).toDouble();
+    if (physicalDiameter <= 0) return;
+
+    cv::Mat gray, blur, thresh;
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
+
+    cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
+    cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    if (!contours.empty()) {
+        auto largestContour = *std::max_element(contours.begin(), contours.end(),
+            [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) {
+                return cv::contourArea(a) < cv::contourArea(b);
+            });
+
+        cv::Point2f center;
+        float radius = 0;
+        cv::minEnclosingCircle(largestContour, center, radius);
+
+        if (radius > 50)
+        {
+            double calculatedPpm = (radius * 2.0) / physicalDiameter;
+            settings.setValue("ppm", calculatedPpm);
+            setPpm(calculatedPpm);
+
+            cv::circle(src, cv::Point(std::round(center.x), std::round(center.y)), std::round(radius), cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+            cv::circle(src, cv::Point(std::round(center.x), std::round(center.y)), 3, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
+            cv::imwrite("calib_result.png", src);
+
+            emit statusUpdated("Calibration complete");
+            return;
+        }
+    }
+    emit statusUpdated("Calibration Not Done - No Circle Found");
+}
+
+QImage CameraWorker::matToQImage(const cv::Mat &mat) {
+    if (mat.type() == CV_8UC3) {
+        cv::Mat rgb;
+        cv::cvtColor(mat, rgb, cv::COLOR_BGR2RGB);
+        return QImage(rgb.data, rgb.cols, rgb.rows, static_cast<int>(rgb.step), QImage::Format_RGB888).copy();
+    } else if (mat.type() == CV_8UC1) {
+        QImage img(mat.data, mat.cols, mat.rows, static_cast<int>(mat.step), QImage::Format_Indexed8);
+        QVector<QRgb> colorTable;
+        for (int i = 0; i < 256; i++) colorTable.push_back(qRgb(i, i, i));
+        img.setColorTable(colorTable);
+        return img.copy();
+    }
+    return QImage();
+}
+
+void CameraWorker::processFrame(cv::Mat &frame) {
+    cv::Mat liveGray, diff, thresh;
+    cv::cvtColor(frame, liveGray, cv::COLOR_BGR2GRAY);
+    cv::medianBlur(liveGray, liveGray, 7);
+
+    cv::absdiff(m_backgroundGray, liveGray, diff);
+    cv::threshold(diff, thresh, m_thresholdValue, 255, cv::THRESH_BINARY);
+
+    if (cv::countNonZero(thresh) > 1250) {
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+        if (!contours.empty()) {
+            size_t largestIdx = 0;
+            double maxArea = 0;
+            for (size_t i = 0; i < contours.size(); ++i) {
+                double area = cv::contourArea(contours[i]);
+                if (area > maxArea) { maxArea = area; largestIdx = i; }
+            }
+
+            cv::Rect boundingBox = cv::boundingRect(contours[largestIdx]);
+            double aspect = static_cast<double>(boundingBox.width) / boundingBox.height;
+
+            if (aspect > 0.22 && aspect < 4.5 && maxArea > 800) {
+                cv::Moments mu = cv::moments(contours[largestIdx], true);
+                if (mu.m00 > 0) {
+                    cv::Point currentCentroid(mu.m10 / mu.m00, mu.m01 / mu.m00);
+                    double dist = std::hypot(currentCentroid.x - m_lastCentroid.x, currentCentroid.y - m_lastCentroid.y);
+
+                    if (dist > MOVEMENT_THRESHOLD) {
+                        m_stableFrameCount = 0;
+                        m_hasMeasuredCurrentObject = false;
+                        emit statusUpdated("Object moving...");
+                    } else {
+                        if (!m_hasMeasuredCurrentObject) {
+                            m_stableFrameCount++;
+                            if (m_stableFrameCount >= FRAMES_TO_STABILIZE) {
+                                m_hasMeasuredCurrentObject = true;
+                                triggerAutoMeasurement(frame);
+                            }
+                        }
+                    }
+                    m_lastCentroid = currentCentroid;
+                }
+            }
+        }
+    } else {
+        resetSnapshotState();
+    }
+}
+
+void CameraWorker::triggerAutoMeasurement(cv::Mat &frame) {
+    QString cvDisplayString = "";
+
+    switch (m_mode) {
+        case MeasurementMode::Round:    cvDisplayString = measureRound(frame); break;
+        case MeasurementMode::Pear:     cvDisplayString = measurePear(frame); break;
+        case MeasurementMode::Oval:     cvDisplayString = measureOval(frame); break;
+        case MeasurementMode::Heart:    cvDisplayString = measureHeart(frame); break;
+        case MeasurementMode::Marquise: cvDisplayString = measureMarquise(frame); break;
+        case MeasurementMode::Poly:     cvDisplayString = measurePolygon(frame); break;
+        case MeasurementMode::General:  cvDisplayString = measureGeneral(frame); break;
+        case MeasurementMode::GeneralC: cvDisplayString = measureGeneralC(frame); break;
+        case MeasurementMode::Custom:   cvDisplayString = measureCustom(frame); break;
+        default: return;
+    }
+
+    if (!cvDisplayString.isEmpty()) emit statusUpdated(cvDisplayString);
+
+    if (cvDisplayString.isEmpty() || cvDisplayString.contains("Error") ||
+        cvDisplayString.contains("Please Calibrate") || cvDisplayString.toLower().contains("object")) {
+        return;
+    }
+
+    double extractedLength = 0.0, extractedWidth = 0.0;
+
+    if (m_mode == MeasurementMode::Round) {
+        QStringList parts = cvDisplayString.split(" ", QString::SkipEmptyParts);
+        if (parts.size() >= 3) extractedLength = parts[2].toDouble();
+    }
+    else if (cvDisplayString.contains("Side")) {
+        QRegularExpression regex("Side\\s+\\d+:\\s+([0-9]+(?:\\.[0-9]+)?)");
+        QRegularExpressionMatchIterator i = regex.globalMatch(cvDisplayString);
+        double maxSide = 0.0, minSide = 999999.0;
+        while (i.hasNext()) {
+            double val = i.next().captured(1).toDouble();
+            if (val > maxSide) maxSide = val;
+            if (val < minSide) minSide = val;
+        }
+        extractedLength = maxSide;
+        extractedWidth = (minSide == 999999.0) ? 0.0 : minSide;
+    }
+    else {
+        QRegularExpression regex("[0-9]+(?:\\.[0-9]+)?");
+        QRegularExpressionMatchIterator i = regex.globalMatch(cvDisplayString);
+        if (i.hasNext()) extractedLength = i.next().captured(0).toDouble();
+        if (i.hasNext()) extractedWidth = i.next().captured(0).toDouble();
+    }
+    emit measurementResult(cvDisplayString,extractedLength,extractedWidth);
+    // ==========================================================
+    // SQLITE DATABASE RULE MATCHING & RASPBERRY PI GPIO PULSE
+    // ==========================================================
+    int targetSquareNumber = -1;
+    QSettings settings("MetricScope", "Settings");
+    QString currentFile = settings.value("cmbFile", "Default_Profile").toString();
+
+    QSqlDatabase db = QSqlDatabase::contains("qt_sql_default_connection")
+                        ? QSqlDatabase::database("qt_sql_default_connection")
+                        : QSqlDatabase::addDatabase("QSQLITE");
+
+    if (!db.isOpen()) {
+        db.setDatabaseName("History.db");
+        if (!db.open()) return;
+    }
+
+    if (db.isOpen()) {
+        QSqlQuery query;
+        query.prepare("SELECT Number, FromLength, ToLength, FromWidth, ToWidth FROM TrayRules WHERE FileName = :file ORDER BY Number ASC;");
+        query.bindValue(":file", currentFile);
+
+        if (query.exec()) {
+            while (query.next()) {
+                int number = query.value("Number").toInt();
+                double fromLen = query.value("FromLength").toDouble();
+                double toLen = query.value("ToLength").toDouble();
+                double fromWid = query.value("FromWidth").toDouble();
+                double toWid = query.value("ToWidth").toDouble();
+
+                if (m_mode == MeasurementMode::Round) {
+                    if (extractedLength >= fromLen && extractedLength <= toLen) {
+                        targetSquareNumber = number;
+                        break;
+                    }
+                } else {
+                    if (extractedLength >= fromLen && extractedLength <= toLen &&
+                        extractedWidth >= fromWid && extractedWidth <= toWid) {
+                        targetSquareNumber = number;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (targetSquareNumber != -1) {
+        QString storageFilePath = "tray_counters.json";
+        QJsonObject countersObj;
+
+        QFile loadFile(storageFilePath);
+        if (loadFile.open(QIODevice::ReadOnly)) {
+            countersObj = QJsonDocument::fromJson(loadFile.readAll()).object();
+            loadFile.close();
+        }
+
+        QString key = QString::number(targetSquareNumber);
+        countersObj[key] = countersObj.value(key).toInt(0) + 1;
+
+        QFile saveFile(storageFilePath);
+        if (saveFile.open(QIODevice::WriteOnly)) {
+            saveFile.write(QJsonDocument(countersObj).toJson());
+            saveFile.close();
+        }
+
+        triggerPiGpioOutput(targetSquareNumber);
+    }
+}
+
+// ============================================================================
+// HELPER METHODS
+// ============================================================================
+void CameraWorker::requestCalibration() {
+    QMutexLocker locker(&m_mutex);
+    m_calibrationFlag = true;
+}
+
+double CameraWorker::getPpm() {
+    QSettings settings("MetricScope", "Settings");
+    double p = settings.value("ppm", 1.0).toDouble();
+    return (p <= 0) ? 1.0 : p;
+}
+
+double CameraWorker::applyVariation(double rawMeasurementMM, bool isLength) {
+    int rangeIndex = static_cast<int>(std::floor(rawMeasurementMM));
+    if (rangeIndex > 24) rangeIndex = 24;
+    if (rangeIndex < 0) rangeIndex = 0;
+
+    QSettings settings("MetricScope", "Settings");
+    QString regKey = isLength ? QString("LenVar_%1").arg(rangeIndex) : QString("WidVar_%1").arg(rangeIndex);
+
+    double variation = settings.value(regKey, 0.0).toDouble();
+    return rawMeasurementMM + variation;
+}
+
+void CameraWorker::triggerPiGpioOutput(int boxNumber) {
+    int gpioPin = -1;
+    switch (boxNumber) {
+        case 1:  gpioPin = 4;  break;  // BCM 4  (Physical Pin 7)
+        case 2:  gpioPin = 5;  break;  // BCM 5  (Physical Pin 29)
+        case 3:  gpioPin = 6;  break;  // BCM 6  (Physical Pin 31)
+        case 4:  gpioPin = 7;  break;  // BCM 7  (Physical Pin 26)
+        case 5:  gpioPin = 8;  break;  // BCM 8  (Physical Pin 24)
+        case 6:  gpioPin = 9;  break;  // BCM 9  (Physical Pin 21)
+        case 7:  gpioPin = 10; break;  // BCM 10 (Physical Pin 19)
+        case 8:  gpioPin = 11; break;  // BCM 11 (Physical Pin 23)
+        case 9:  gpioPin = 12; break;  // BCM 12 (Physical Pin 32)
+        case 10: gpioPin = 13; break;  // BCM 13 (Physical Pin 33)
+        case 11: gpioPin = 16; break;  // BCM 16 (Physical Pin 36)
+        case 12: gpioPin = 19; break;  // BCM 19 (Physical Pin 35)
+        case 13: gpioPin = 20; break;  // BCM 20 (Physical Pin 38)
+        case 14: gpioPin = 21; break;  // BCM 21 (Physical Pin 40)
+        case 15: gpioPin = 22; break;  // BCM 22 (Physical Pin 15)
+        case 16: gpioPin = 23; break;  // BCM 23 (Physical Pin 16)
+        case 17: gpioPin = 24; break;  // BCM 24 (Physical Pin 18)
+        case 18: gpioPin = 25; break;  // BCM 25 (Physical Pin 22)
+        case 19: gpioPin = 26; break;  // BCM 26 (Physical Pin 37)
+        case 20: gpioPin = 27; break;  // BCM 27 (Physical Pin 13)
+        default: return;
+    }
+
+    if (gpioPin != -1) {
+        QString cmdOn = QString("gpioset 0 %1=1").arg(gpioPin);
+        QString cmdOff = QString("gpioset 0 %1=0").arg(gpioPin);
+
+        system(cmdOn.toUtf8().constData());
+        QThread::msleep(150);
+        system(cmdOff.toUtf8().constData());
+    }
+}
+
+// ============================================================================
+// SHAPE LOGIC
+// ============================================================================
+
+QString CameraWorker::measureGeneral(cv::Mat &src) {
+    if (src.empty()) return "No Image Data";
+    double ppm = getPpm();
+
+    cv::Mat gray, blur, thresh;
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray, blur, cv::Size(3, 3), 0);
+    cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
+    cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    if (contours.empty()) return "No Shape Found";
+
+    auto largestContour = *std::max_element(contours.begin(), contours.end(),
+        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
+
+    if (cv::contourArea(largestContour) < 800) return "No Object Detected (Noise Ignored)";
+
+    std::vector<cv::Point> hull;
+    cv::convexHull(largestContour, hull);
+
+    std::vector<cv::Point> smoothContour;
+    double epsilon = 0.01 * cv::arcLength(hull, true);
+    cv::approxPolyDP(hull, smoothContour, epsilon, true);
+
+    cv::RotatedRect minRect = cv::minAreaRect(smoothContour);
+
+    double boxLengthPx = std::max(minRect.size.width, minRect.size.height);
+    double boxWidthPx = std::min(minRect.size.width, minRect.size.height);
+
+    double boxLengthMM = applyVariation(boxLengthPx / ppm, true);
+    double boxWidthMM = applyVariation(boxWidthPx / ppm, false);
+    double ratio = (boxWidthMM == 0) ? 0 : boxLengthMM / boxWidthMM;
+
+    cv::Point2f rectPoints[4];
+    minRect.points(rectPoints);
+    std::vector<cv::Point> boxPoints(4);
+    for (int i = 0; i < 4; i++) boxPoints[i] = cv::Point(std::round(rectPoints[i].x), std::round(rectPoints[i].y));
+
+    std::vector<std::vector<cv::Point>> boxWrapper = { boxPoints };
+    std::vector<std::vector<cv::Point>> smoothWrapper = { smoothContour };
+
+    cv::polylines(src, boxWrapper, true, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
+    cv::polylines(src, smoothWrapper, true, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+    cv::circle(src, minRect.center, 4, cv::Scalar(255, 255, 255), -1, cv::LINE_AA);
+
+    QString text = QString("Box L: %1mm | W: %2mm").arg(boxLengthMM, 0, 'f', 2).arg(boxWidthMM, 0, 'f', 2);
+    cv::putText(src, text.toStdString(), cv::Point(15, 35), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
+
+    cv::Mat printCanvas(src.size(), CV_8UC3, cv::Scalar(255, 255, 255));
+    cv::polylines(printCanvas, smoothWrapper, true, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
+    cv::Rect cropRect = cv::boundingRect(smoothContour);
+    cropRect.x = std::max(0, cropRect.x - 15);
+    cropRect.y = std::max(0, cropRect.y - 15);
+    cropRect.width = std::min(printCanvas.cols - cropRect.x, cropRect.width + 30);
+    cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
+    cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
+
+    cv::imwrite("Box_Shape_Result.png", src);
+    return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(boxLengthMM, 0, 'f', 2).arg(boxWidthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
+}
+
+QString CameraWorker::measureMarquise(cv::Mat &src) {
+    if (src.empty()) return "No Image Data";
+    double ppm = getPpm();
+
+    cv::Mat gray, blur, thresh;
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
+    cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    if (contours.empty()) return "No Shape Found";
+
+    auto largestContour = *std::max_element(contours.begin(), contours.end(),
+        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
+
+    std::vector<cv::Point> hull;
+    cv::convexHull(largestContour, hull);
+
+    std::vector<cv::Point> smoothContour;
+    double epsilon = 0.01 * cv::arcLength(hull, true);
+    cv::approxPolyDP(hull, smoothContour, epsilon, true);
+
+    cv::Point tip1(0, 0), tip2(0, 0);
+    double maxTipDist = 0;
+    for (size_t i = 0; i < smoothContour.size(); i++) {
+        for (size_t j = i + 1; j < smoothContour.size(); j++) {
+            double d = std::hypot(smoothContour[i].x - smoothContour[j].x, smoothContour[i].y - smoothContour[j].y);
+            if (d > maxTipDist) { maxTipDist = d; tip1 = smoothContour[i]; tip2 = smoothContour[j]; }
+        }
+    }
+
+    double maxWidthDist = 0;
+    cv::Point widthPoint1(0, 0), widthPoint2(0, 0);
+    double axisX = tip2.x - tip1.x;
+    double axisY = tip2.y - tip1.y;
+    double axisLength = std::hypot(axisX, axisY);
+
+    for (size_t i = 0; i < smoothContour.size(); i++) {
+        for (size_t j = i + 1; j < smoothContour.size(); j++) {
+            double sX = smoothContour[j].x - smoothContour[i].x;
+            double sY = smoothContour[j].y - smoothContour[i].y;
+            double crossProduct = std::abs(sX * axisY - sY * axisX) / (axisLength == 0 ? 1 : axisLength);
+            if (crossProduct > maxWidthDist) {
+                maxWidthDist = crossProduct;
+                widthPoint1 = smoothContour[i];
+                widthPoint2 = smoothContour[j];
+            }
+        }
+    }
+
+    double lengthMM = applyVariation(maxTipDist / ppm, true);
+    double widthMM = applyVariation(maxWidthDist / ppm, false);
+    double ratio = (widthMM == 0) ? 0 : lengthMM / widthMM;
+
+    cv::line(src, tip1, tip2, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
+    cv::line(src, widthPoint1, widthPoint2, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+    std::vector<std::vector<cv::Point>> wrapper = { smoothContour };
+    cv::polylines(src, wrapper, true, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+
+    cv::Point lenMid((tip1.x + tip2.x) / 2 + 20, (tip1.y + tip2.y) / 2 - 15);
+    cv::Point widMid((widthPoint1.x + widthPoint2.x) / 2 - 80, (widthPoint1.y + widthPoint2.y) / 2 + 25);
+
+    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), lenMid, cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+    cv::putText(src, QString("W: %1mm").arg(widthMM, 0, 'f', 2).toStdString(), widMid, cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+
+    cv::Mat printCanvas(src.size(), CV_8UC3, cv::Scalar(255, 255, 255));
+    cv::polylines(printCanvas, wrapper, true, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
+    cv::Rect cropRect = cv::boundingRect(smoothContour);
+    cropRect.x = std::max(0, cropRect.x - 15);
+    cropRect.y = std::max(0, cropRect.y - 15);
+    cropRect.width = std::min(printCanvas.cols - cropRect.x, cropRect.width + 30);
+    cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
+    cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
+
+    cv::imwrite("Marquise_Result.png", src);
+    return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
+}
+
+QString CameraWorker::measureHeart(cv::Mat &src) {
+    if (src.empty()) return "No Shape Found";
+    double ppm = getPpm();
+
+    cv::Mat gray, blur, thresh;
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray, blur, cv::Size(3, 3), 0);
+    cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+    if (contours.empty()) return "No Shape Found";
+
+    auto largestContour = *std::max_element(contours.begin(), contours.end(),
+        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
+
+    if (largestContour.size() < 5) return "Shape too simple";
+
+    std::vector<int> hullIndices;
+    cv::convexHull(largestContour, hullIndices, false, false);
+
+    std::vector<cv::Vec4i> defects;
+    cv::convexityDefects(largestContour, hullIndices, defects);
+    if (defects.empty()) return "No Heart Cleft Found";
+
+    auto maxDefect = *std::max_element(defects.begin(), defects.end(), [](const cv::Vec4i& a, const cv::Vec4i& b) { return a[3] < b[3]; });
+
+    cv::Point lobe1 = largestContour[maxDefect[0]];
+    cv::Point lobe2 = largestContour[maxDefect[1]];
+    cv::Point cleft = largestContour[maxDefect[2]];
+
+    double baseDx = lobe2.x - lobe1.x;
+    double baseDy = lobe2.y - lobe1.y;
+    double baseLenSq = baseDx * baseDx + baseDy * baseDy;
+    if (baseLenSq == 0) baseLenSq = 1;
+
+    double t = ((cleft.x - lobe1.x) * baseDx + (cleft.y - lobe1.y) * baseDy) / baseLenSq;
+    cv::Point dipTop(std::round(lobe1.x + t * baseDx), std::round(lobe1.y + t * baseDy));
+    double dipPx = std::hypot(cleft.x - dipTop.x, cleft.y - dipTop.y);
+
+    cv::Point apex = dipTop;
+    double maxDistToDipTop = 0;
+    for (const auto& p : largestContour) {
+        double dist = std::hypot(p.x - dipTop.x, p.y - dipTop.y);
+        if (dist > maxDistToDipTop) { maxDistToDipTop = dist; apex = p; }
+    }
+
+    double lenDx = apex.x - dipTop.x;
+    double lenDy = apex.y - dipTop.y;
+    double totalLengthPx = std::hypot(lenDx, lenDy);
+    double dirX = lenDx / (totalLengthPx == 0 ? 1 : totalLengthPx);
+    double dirY = lenDy / (totalLengthPx == 0 ? 1 : totalLengthPx);
+
+    double perpX = -dirY;
+    double perpY = dirX;
+
+    double minProj = 1e9, maxProj = -1e9;
+    cv::Point leftPoint = dipTop, rightPoint = dipTop;
+    for (const auto& p : largestContour) {
+        double proj = (p.x - dipTop.x) * perpX + (p.y - dipTop.y) * perpY;
+        if (proj < minProj) { minProj = proj; leftPoint = p; }
+        if (proj > maxProj) { maxProj = proj; rightPoint = p; }
+    }
+
+    double lengthMM = applyVariation(totalLengthPx / ppm, true);
+    double widthMM = applyVariation((maxProj - minProj) / ppm, false);
+    double dipDepthMM = dipPx / ppm;
+    double ratio = (widthMM == 0) ? 0 : lengthMM / widthMM;
+
+    cv::line(src, lobe1, lobe2, cv::Scalar(128, 128, 128), 1, cv::LINE_AA);
+    cv::line(src, cleft, dipTop, cv::Scalar(0, 165, 255), 2, cv::LINE_AA);
+    cv::line(src, dipTop, apex, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
+    cv::line(src, leftPoint, rightPoint, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+    std::vector<std::vector<cv::Point>> contourWrapper = { largestContour };
+    cv::polylines(src, contourWrapper, true, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+
+    cv::putText(src, QString("Total L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), cv::Point(dipTop.x + 15, dipTop.y + static_cast<int>(lenDy * 0.5)), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+    cv::putText(src, QString("W: %1mm").arg(widthMM, 0, 'f', 2).toStdString(), cv::Point(leftPoint.x + 20, leftPoint.y - 15), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+    cv::putText(src, QString("Dip: %1mm").arg(dipDepthMM, 0, 'f', 2).toStdString(), cv::Point(cleft.x - 35, cleft.y + 25), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 165, 255), 2, cv::LINE_AA);
+
+    cv::Mat printCanvas(src.size(), CV_8UC3, cv::Scalar(255, 255, 255));
+    cv::polylines(printCanvas, contourWrapper, true, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
+    cv::Rect cropRect = cv::boundingRect(largestContour);
+    cropRect.x = std::max(0, cropRect.x - 15);
+    cropRect.y = std::max(0, cropRect.y - 15);
+    cropRect.width = std::min(printCanvas.cols - cropRect.x, cropRect.width + 30);
+    cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
+    cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
+
+    cv::imwrite("Heart_Result.png", src);
+    return QString("Length : %1 mm\nWidth  : %2 mm\nDip    : %3 mm\nL/W Ratio : %4").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(dipDepthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
+}
+
+QString CameraWorker::measurePear(cv::Mat &src) {
+    if (src.empty()) return "No Shape Found";
+    double ppm = getPpm();
+
+    cv::Mat gray, blur, thresh;
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
+    cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+    if (contours.empty()) return "No Shape Found";
+
+    auto largestContour = *std::max_element(contours.begin(), contours.end(),
+        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
+
+    std::vector<cv::Point> hull;
+    cv::convexHull(largestContour, hull);
+
+    cv::Moments mu = cv::moments(hull);
+    cv::Point centroid(mu.m10 / mu.m00, mu.m01 / mu.m00);
+
+    cv::Point pearTip = hull[0];
+    double maxDistToCentroid = 0;
+    for (const auto& p : hull) {
+        double dist = std::hypot(p.x - centroid.x, p.y - centroid.y);
+        if (dist > maxDistToCentroid) { maxDistToCentroid = dist; pearTip = p; }
+    }
+
+    double dirX = centroid.x - pearTip.x;
+    double dirY = centroid.y - pearTip.y;
+    double lenVector = std::hypot(dirX, dirY);
+    dirX /= (lenVector == 0 ? 1 : lenVector);
+    dirY /= (lenVector == 0 ? 1 : lenVector);
+
+    cv::Point pearBase = centroid;
+    double maxBaseProjection = 0;
+    for (const auto& p : hull) {
+        double projection = (p.x - pearTip.x) * dirX + (p.y - pearTip.y) * dirY;
+        if (projection > maxBaseProjection) {
+            maxBaseProjection = projection;
+            pearBase = cv::Point(pearTip.x + (int)(dirX * projection), pearTip.y + (int)(dirY * projection));
+        }
+    }
+
+    double maxWidthDist = 0;
+    cv::Point widthL(0, 0), widthR(0, 0);
+    for (size_t i = 0; i < hull.size(); i++) {
+        for (size_t j = i + 1; j < hull.size(); j++) {
+            double sX = hull[j].x - hull[i].x;
+            double sY = hull[j].y - hull[i].y;
+            double perpDistance = std::abs(sX * dirY - sY * dirX);
+            if (perpDistance > maxWidthDist) { maxWidthDist = perpDistance; widthL = hull[i]; widthR = hull[j]; }
+        }
+    }
+
+    double lengthMM = applyVariation(maxBaseProjection / ppm, true);
+    double widthMM = applyVariation(maxWidthDist / ppm, false);
+    double ratio = (widthMM == 0) ? 0 : lengthMM / widthMM;
+
+    cv::line(src, pearTip, pearBase, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
+    cv::line(src, widthL, widthR, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+    cv::circle(src, centroid, 5, cv::Scalar(0, 165, 255), -1, cv::LINE_AA);
+    std::vector<std::vector<cv::Point>> hullWrapper = { hull };
+    cv::polylines(src, hullWrapper, true, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+
+    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), cv::Point(centroid.x + 25, centroid.y - 20), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+    cv::putText(src, QString("W: %1mm").arg(widthMM, 0, 'f', 2).toStdString(), cv::Point(widthL.x + 15, widthL.y + 25), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+
+    cv::Mat printCanvas(src.size(), CV_8UC3, cv::Scalar(255, 255, 255));
+    cv::polylines(printCanvas, hullWrapper, true, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
+    cv::Rect cropRect = cv::boundingRect(hull);
+    cropRect.x = std::max(0, cropRect.x - 15);
+    cropRect.y = std::max(0, cropRect.y - 15);
+    cropRect.width = std::min(printCanvas.cols - cropRect.x, cropRect.width + 30);
+    cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
+    cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
+
+    cv::imwrite("Pear_Result.png", src);
+    return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
+}
+
+QString CameraWorker::measureOval(cv::Mat &src) {
+    if (src.empty()) return "No Shape Found";
+    double ppm = getPpm();
+
+    cv::Mat gray, blur, thresh;
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
+    cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+    if (contours.empty()) return "No Shape Found";
+
+    auto largestContour = *std::max_element(contours.begin(), contours.end(),
+        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
+
+    std::vector<cv::Point> hull;
+    cv::convexHull(largestContour, hull);
+
+    cv::RotatedRect minRect = cv::minAreaRect(hull);
+    double lengthMM = applyVariation(std::max(minRect.size.width, minRect.size.height) / ppm, true);
+    double widthMM = applyVariation(std::min(minRect.size.width, minRect.size.height) / ppm, false);
+    double ratio = (widthMM == 0) ? 0 : lengthMM / widthMM;
+
+    cv::Point2f rectPoints[4];
+    minRect.points(rectPoints);
+    cv::Point pt01((rectPoints[0].x + rectPoints[1].x) / 2, (rectPoints[0].y + rectPoints[1].y) / 2);
+    cv::Point pt12((rectPoints[1].x + rectPoints[2].x) / 2, (rectPoints[1].y + rectPoints[2].y) / 2);
+    cv::Point pt23((rectPoints[2].x + rectPoints[3].x) / 2, (rectPoints[2].y + rectPoints[3].y) / 2);
+    cv::Point pt30((rectPoints[3].x + rectPoints[0].x) / 2, (rectPoints[3].y + rectPoints[0].y) / 2);
+
+    cv::Point lenStart, lenEnd, widStart, widEnd;
+    if (std::hypot(pt01.x - pt23.x, pt01.y - pt23.y) > std::hypot(pt12.x - pt30.x, pt12.y - pt30.y)) {
+        lenStart = pt01; lenEnd = pt23; widStart = pt12; widEnd = pt30;
+    } else {
+        lenStart = pt12; lenEnd = pt30; widStart = pt01; widEnd = pt23;
+    }
+
+    cv::line(src, lenStart, lenEnd, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
+    cv::line(src, widStart, widEnd, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+    cv::circle(src, minRect.center, 5, cv::Scalar(0, 165, 255), -1, cv::LINE_AA);
+    std::vector<std::vector<cv::Point>> hullWrapper = { hull };
+    cv::polylines(src, hullWrapper, true, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+
+    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), cv::Point(minRect.center.x + 25, minRect.center.y - 20), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+    cv::putText(src, QString("W: %1mm").arg(widthMM, 0, 'f', 2).toStdString(), cv::Point(widStart.x + 15, widStart.y + 25), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+
+    cv::Mat printCanvas(src.size(), CV_8UC3, cv::Scalar(255, 255, 255));
+    cv::polylines(printCanvas, hullWrapper, true, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
+    cv::Rect cropRect = cv::boundingRect(hull);
+    cropRect.x = std::max(0, cropRect.x - 15); cropRect.y = std::max(0, cropRect.y - 15);
+    cropRect.width = std::min(printCanvas.cols - cropRect.x, cropRect.width + 30);
+    cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
+    cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
+
+    cv::imwrite("ovel_Result.png", src);
+    return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
+}
+
+// ============================================================================
+// POLYGON & CUSTOM SHAPE MATH HELPERS
+// ============================================================================
+double CameraWorker::distance(cv::Point p1, cv::Point p2) {
+    return std::hypot(p2.x - p1.x, p2.y - p1.y);
+}
+
+double CameraWorker::calculateAngle(cv::Point prev, cv::Point current, cv::Point next) {
+    double ax = prev.x - current.x;
+    double ay = prev.y - current.y;
+    double bx = next.x - current.x;
+    double by = next.y - current.y;
+
+    double dot = (ax * bx) + (ay * by);
+    double magA = std::hypot(ax, ay);
+    double magB = std::hypot(bx, by);
+
+    if (magA == 0 || magB == 0) return 0;
+
+    double cosTheta = dot / (magA * magB);
+    cosTheta = std::max(-1.0, std::min(1.0, cosTheta));
+    return std::acos(cosTheta) * 180.0 / CV_PI;
+}
+
+void CameraWorker::sortCornersClockwise(std::vector<cv::Point>& points) {
+    if (points.empty()) return;
+    cv::Point2f center(0, 0);
+    for (auto p : points) { center.x += p.x; center.y += p.y; }
+    center.x /= points.size();
+    center.y /= points.size();
+
+    std::sort(points.begin(), points.end(), [center](cv::Point a, cv::Point b) {
+        return std::atan2(a.y - center.y, a.x - center.x) < std::atan2(b.y - center.y, b.x - center.x);
+    });
+}
+
+void CameraWorker::getInvariantTransform(const std::vector<cv::Point>& hull, cv::Point2f& centroid, double& angle, float& scale) {
+    cv::Moments mu = cv::moments(hull);
+    centroid = cv::Point2f(mu.m10 / mu.m00, mu.m01 / mu.m00);
+    scale = std::sqrt(mu.m00);
+
+    double theta = 0.0;
+    if (std::abs(mu.mu20 - mu.mu02) < 1e-2 && std::abs(mu.mu11) < 1e-2) {
+        double maxR = 0;
+        for (auto pt : hull) {
+            double r2 = std::pow(pt.x - centroid.x, 2) + std::pow(pt.y - centroid.y, 2);
+            if (r2 > maxR) { maxR = r2; theta = std::atan2(pt.y - centroid.y, pt.x - centroid.x); }
+        }
+    } else {
+        theta = 0.5 * std::atan2(2 * mu.mu11, mu.mu20 - mu.mu02);
+    }
+
+    double dx = std::cos(theta), dy = std::sin(theta);
+    double nx = -dy, ny = dx;
+
+    double maxP1 = 0, minP1 = 0, maxP2 = 0, minP2 = 0;
+    for (auto pt : hull) {
+        double p1 = (pt.x - centroid.x) * dx + (pt.y - centroid.y) * dy;
+        double p2 = (pt.x - centroid.x) * nx + (pt.y - centroid.y) * ny;
+        if (p1 > maxP1) maxP1 = p1; if (p1 < minP1) minP1 = p1;
+        if (p2 > maxP2) maxP2 = p2; if (p2 < minP2) minP2 = p2;
+    }
+
+    double span1 = maxP1 - minP1;
+    double span2 = maxP2 - minP2;
+    double asym1 = std::abs(std::abs(maxP1) - std::abs(minP1));
+    double asym2 = std::abs(std::abs(maxP2) - std::abs(minP2));
+
+    if (std::max(asym1, asym2) > 0.05 * scale) {
+        if (asym2 > asym1) {
+            theta += CV_PI / 2.0;
+        }
+        if (std::abs(minP1) > std::abs(maxP1)) theta += CV_PI;
+    } else {
+        if (span2 > span1) theta += CV_PI / 2.0;
+        double finalDx = std::cos(theta);
+        double finalDy = std::sin(theta);
+        if (finalDy > 0.001 || (std::abs(finalDy) <= 0.001 && finalDx < 0)) theta += CV_PI;
+    }
+
+    while (theta < 0) theta += 2 * CV_PI;
+    while (theta >= 2 * CV_PI) theta -= 2 * CV_PI;
+    angle = theta;
+}
+
+// ============================================================================
+// POLYGON MEASUREMENT
+// ============================================================================
+QString CameraWorker::measurePolygon(cv::Mat &src) {
+    if (src.empty()) return "No Image Data";
+    double ppm = getPpm();
+
+    cv::Mat gray, blur, thresh;
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
+    cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
+    cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    if (contours.empty()) return "No Polygon Found";
+    auto largestContour = *std::max_element(contours.begin(), contours.end(),
+        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
+
+    if (cv::contourArea(largestContour) < 800) return "No Object Detected (Noise Ignored)";
+
+    std::vector<cv::Point> hull;
+    cv::convexHull(largestContour, hull);
+
+    double perimeter = cv::arcLength(hull, true);
+    std::vector<cv::Point> polygon;
+    cv::approxPolyDP(hull, polygon, 0.02 * perimeter, true);
+
+    if (polygon.size() < 3) return "Invalid Polygon Corners";
+
+    sortCornersClockwise(polygon);
+
+    double maxDistSq = 0;
+    cv::Point tip1 = polygon[0], tip2 = polygon[0];
+    for (size_t i = 0; i < polygon.size(); i++) {
+        for (size_t j = i + 1; j < polygon.size(); j++) {
+            double dSq = std::pow(polygon[i].x - polygon[j].x, 2) + std::pow(polygon[i].y - polygon[j].y, 2);
+            if (dSq > maxDistSq) { maxDistSq = dSq; tip1 = polygon[i]; tip2 = polygon[j]; }
+        }
+    }
+
+    double lengthPx = std::sqrt(maxDistSq);
+    if (lengthPx == 0) return "Invalid Shape Profile";
+
+    double ux = (tip2.x - tip1.x) / lengthPx;
+    double uy = (tip2.y - tip1.y) / lengthPx;
+    double nx = uy;
+    double ny = -ux;
+
+    double maxLeftDist = 0, maxRightDist = 0;
+    for (const auto& p : polygon) {
+        double px = p.x - tip1.x;
+        double py = p.y - tip1.y;
+        double projection = px * nx + py * ny;
+        if (projection > maxLeftDist) maxLeftDist = projection;
+        if (projection < maxRightDist) maxRightDist = projection;
+    }
+
+    double widthPx = maxLeftDist - maxRightDist;
+    double generalLengthMM = applyVariation(lengthPx / ppm, true);
+    double generalWidthMM = applyVariation(widthPx / ppm, false);
+
+    double midX = (tip1.x + tip2.x) / 2.0;
+    double midY = (tip1.y + tip2.y) / 2.0;
+    double shift = (maxLeftDist + maxRightDist) / 2.0;
+    double centerX = midX + shift * nx;
+    double centerY = midY + shift * ny;
+    double halfL = lengthPx / 2.0, halfW = widthPx / 2.0;
+
+    std::vector<cv::Point> boxPoints(4);
+    boxPoints[0] = cv::Point(std::round(centerX + halfL * ux + halfW * nx), std::round(centerY + halfL * uy + halfW * ny));
+    boxPoints[1] = cv::Point(std::round(centerX - halfL * ux + halfW * nx), std::round(centerY - halfL * uy + halfW * ny));
+    boxPoints[2] = cv::Point(std::round(centerX - halfL * ux - halfW * nx), std::round(centerY - halfL * uy - halfW * ny));
+    boxPoints[3] = cv::Point(std::round(centerX + halfL * ux - halfW * nx), std::round(centerY + halfL * uy - halfW * ny));
+
+    std::vector<std::vector<cv::Point>> boxWrapper = { boxPoints };
+    cv::polylines(src, boxWrapper, true, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
+    cv::line(src, tip1, tip2, cv::Scalar(0, 165, 255), 1, cv::LINE_AA);
+
+    for (size_t i = 0; i < polygon.size(); i++) {
+        cv::Point p1 = polygon[i];
+        cv::Point p2 = polygon[(i + 1) % polygon.size()];
+        cv::line(src, p1, p2, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+
+        double mmDistance = distance(p1, p2) / ppm;
+        cv::Point mid((p1.x + p2.x) / 2, (p1.y + p2.y) / 2);
+        cv::putText(src, QString("%1mm").arg(mmDistance, 0, 'f', 2).toStdString(), mid, cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+    }
+
+    QString angleString = "";
+    for (size_t i = 0; i < polygon.size(); i++) {
+        cv::Point prev = polygon[(i - 1 + polygon.size()) % polygon.size()];
+        cv::Point current = polygon[i];
+        cv::Point next = polygon[(i + 1) % polygon.size()];
+
+        double angle = calculateAngle(prev, current, next);
+        angleString += QString("Angle %1: %2° ").arg(i + 1).arg(angle, 0, 'f', 1);
+
+        cv::circle(src, current, 4, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
+        cv::putText(src, QString("%1°").arg(angle, 0, 'f', 1).toStdString(), cv::Point(current.x + 10, current.y), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
+    }
+
+    cv::imwrite("Polygon_Result.png", src);
+    return QString("Length: %1 mm\nWidth : %2 mm\n").arg(generalLengthMM, 0, 'f', 2).arg(generalWidthMM, 0, 'f', 2) + angleString;
+}
+
+// ============================================================================
+// CUSTOM SHAPE ENGINE
+// ============================================================================
+QString CameraWorker::measureCustom(cv::Mat &src) {
+    if (m_activeCustomShape.Name.isEmpty()) return "Error: No Active Shape Selected";
+    double ppm = getPpm();
+
+    cv::Mat gray, blur, thresh, edges;
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    cv::medianBlur(gray, gray, 5);
+    cv::Canny(gray, edges, 40, 120);
+
+    cv::Mat element = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(9, 9));
+    cv::morphologyEx(edges, edges, cv::MORPH_CLOSE, element);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(edges, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    if (contours.empty()) return "Object not present";
+    auto largestContour = *std::max_element(contours.begin(), contours.end(),
+        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
+
+    if (cv::contourArea(largestContour) < 1200) return "Object not present";
+
+    std::vector<cv::Point> liveHull;
+    cv::convexHull(largestContour, liveHull);
+
+    cv::Point2f liveCenter;
+    double liveAngle;
+    float liveScale;
+    getInvariantTransform(liveHull, liveCenter, liveAngle, liveScale);
+
+    cv::Point2f calcW1 = projectToScreen(m_activeCustomShape.WidthPt1, liveCenter, liveAngle, liveScale);
+    cv::Point2f calcW2 = projectToScreen(m_activeCustomShape.WidthPt2, liveCenter, liveAngle, liveScale);
+    cv::Point2f calcL1 = projectToScreen(m_activeCustomShape.LengthPt1, liveCenter, liveAngle, liveScale);
+    cv::Point2f calcL2 = projectToScreen(m_activeCustomShape.LengthPt2, liveCenter, liveAngle, liveScale);
+
+    if (m_activeCustomShape.SnapToEdge) {
+        calcW1 = snapToEdgeStraight(liveCenter, calcW1, liveHull);
+        calcW2 = snapToEdgeStraight(liveCenter, calcW2, liveHull);
+        calcL1 = snapToEdgeStraight(liveCenter, calcL1, liveHull);
+        calcL2 = snapToEdgeStraight(liveCenter, calcL2, liveHull);
+    }
+
+    double lengthVal = std::hypot(calcL1.x - calcL2.x, calcL1.y - calcL2.y) / ppm;
+    double widthVal = std::hypot(calcW1.x - calcW2.x, calcW1.y - calcW2.y) / ppm;
+
+    cv::line(src, calcW1, calcW2, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
+    cv::line(src, calcL1, calcL2, cv::Scalar(255, 0, 0), 2, cv::LINE_AA);
+    cv::circle(src, liveCenter, 4, cv::Scalar(0, 255, 0), -1, cv::LINE_AA);
+
+    cv::Mat printCanvas(src.size(), CV_8UC3, cv::Scalar(255, 255, 255));
+    std::vector<std::vector<cv::Point>> outlineWrapper = { largestContour };
+    cv::polylines(printCanvas, outlineWrapper, true, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
+
+    cv::Rect cropRect = cv::boundingRect(largestContour);
+    cropRect.x = std::max(0, cropRect.x - 15); cropRect.y = std::max(0, cropRect.y - 15);
+    cropRect.width = std::min(printCanvas.cols - cropRect.x, cropRect.width + 30);
+    cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
+    cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
+
+    cv::imwrite("CUSTOMS.png", src);
+    return QString("Length: %1\nWidth: %2").arg(lengthVal, 0, 'f', 2).arg(widthVal, 0, 'f', 2);
+}
+
+cv::Point2f CameraWorker::projectToScreen(cv::Point2f localPt, cv::Point2f centroid, double angle, float scale) {
+    double cosA = std::cos(angle);
+    double sinA = std::sin(angle);
+    double uScale = localPt.x * scale;
+    double vScale = localPt.y * scale;
+    return cv::Point2f(centroid.x + uScale * cosA - vScale * sinA, centroid.y + uScale * sinA + vScale * cosA);
+}
+
+cv::Point2f CameraWorker::snapToEdgeStraight(cv::Point2f center, cv::Point2f targetPt, const std::vector<cv::Point>& contour) {
+    float dx = targetPt.x - center.x;
+    float dy = targetPt.y - center.y;
+    float length = std::hypot(dx, dy);
+    if (length == 0) return targetPt;
+
+    float ndx = dx / length;
+    float ndy = dy / length;
+    cv::Point2f lastInsidePt = center;
+
+    for (float d = 0; d < 3000; d += 0.5f) {
+        cv::Point2f testPt(center.x + ndx * d, center.y + ndy * d);
+        double status = cv::pointPolygonTest(contour, testPt, false);
+        if (status < 0) return lastInsidePt;
+        lastInsidePt = testPt;
+    }
+    return targetPt;
+}
+
+QString CameraWorker::measureGeneralC(cv::Mat &src) {
+    return measureMarquise(src);
+}
+
+QString CameraWorker::measureRound(cv::Mat &src) {
+    if (src.empty()) return "No Image Data";
+
+    double ppm = getPpm();
+
+    cv::Mat gray, blur, thresh;
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
+
+    cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
+    cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    if (!contours.empty()) {
+        auto largestContour = *std::max_element(contours.begin(), contours.end(),
+            [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) {
+                return cv::contourArea(a) < cv::contourArea(b);
+            });
+
+        double area = cv::contourArea(largestContour);
+
+        if (area > 500) {
+            cv::Point2f center;
+            float radius;
+            cv::minEnclosingCircle(largestContour, center, radius);
+
+            double realSize = (radius * 2.0) / ppm;
+
+            cv::circle(src, cv::Point(std::round(center.x), std::round(center.y)), std::round(radius), cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
+            cv::circle(src, cv::Point(std::round(center.x), std::round(center.y)), 4, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
+
+            QString resultStr = QString("Diameter : %1 mm").arg(realSize, 0, 'f', 2);
+            cv::Point textPosition(std::round(center.x) + 15, std::round(center.y) + 5);
+            cv::putText(src, resultStr.toStdString(), textPosition, cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+
+            cv::Mat printCanvas(src.size(), CV_8UC3, cv::Scalar(255, 255, 255));
+            std::vector<std::vector<cv::Point>> outlineWrapper = { largestContour };
+
+            cv::polylines(printCanvas, outlineWrapper, true, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
+
+            cv::Rect cropRect = cv::boundingRect(largestContour);
+            cropRect.x = std::max(0, cropRect.x - 15);
+            cropRect.y = std::max(0, cropRect.y - 15);
+            cropRect.width = std::min(printCanvas.cols - cropRect.x, cropRect.width + 30);
+            cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
+
+            cv::Mat croppedForPrint = printCanvas(cropRect);
+            cv::imwrite("ShapeForLabel.png", croppedForPrint);
+            cv::imwrite("Circle.png", src);
+
+            return resultStr;
+        }
+    }
+
+    return "Diameter Not Detected";
+}

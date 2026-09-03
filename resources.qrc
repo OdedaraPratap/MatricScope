@@ -1,0 +1,46 @@
+<RCC>
+    <qresource prefix="/">
+        <file>images/ADD FILE.jpg</file>
+        <file>images/Add shape.jpg</file>
+        <file>images/Backcaali.jpg</file>
+        <file>images/BAGUETTE_Select.jpeg</file>
+        <file>images/BAGUETTE.png</file>
+        <file>images/CALIBRATION.png</file>
+        <file>images/CALIBRATION1.png</file>
+        <file>images/Callibrationin.jpg</file>
+        <file>images/DELETE ALL.jpg</file>
+        <file>images/DELETE FILE.jpg</file>
+        <file>images/DELETE.jpg</file>
+        <file>images/EMERALD_Select.jpeg</file>
+        <file>images/EMERALD.png</file>
+        <file>images/GENERAL.png</file>
+        <file>images/GENERALC.png</file>
+        <file>images/HEART_Select.jpeg</file>
+        <file>images/HEART.png</file>
+        <file>images/HISTORY.jpg</file>
+        <file>images/Logo (2).png</file>
+        <file>images/Logo.png</file>
+        <file>images/MARQUISE_Select.jpeg</file>
+        <file>images/MARQUISE.png</file>
+        <file>images/OVAL_Select.jpeg</file>
+        <file>images/OVAL.png</file>
+        <file>images/PEAR_Select.jpeg</file>
+        <file>images/PEAR.png</file>
+        <file>images/POLYGON_Select.jpeg</file>
+        <file>images/POLYGON.png</file>
+        <file>images/PRINT ALL.jpg</file>
+        <file>images/Print.jpg</file>
+        <file>images/Reset Count.jpg</file>
+        <file>images/ROUND_Select.jpeg</file>
+        <file>images/ROUND.png</file>
+        <file>images/ruler_12479328.png</file>
+        <file>images/SAVE.jpg</file>
+        <file>images/SETTING.png</file>
+        <file>images/Single Print.jpg</file>
+        <file>images/Stop_processed.png</file>
+        <file>images/Stop.png</file>
+        <file>images/TRAY SETTING.jpg</file>
+        <file>images/GENERAL_Select.jpeg</file>
+        <file>images/GENERALC_Select.jpeg</file>
+    </qresource>
+</RCC>
