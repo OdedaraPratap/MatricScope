@@ -13,6 +13,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdlib>
+#include <chrono>
 #include <limits>
 #include <QtConcurrentRun>
 
@@ -96,7 +97,7 @@ void CameraWorker::setMode(MeasurementMode mode) {
     QMutexLocker locker(&m_mutex);
     m_mode = mode;
     qDebug() << "DEBUG: MeasurementMode changed to:" << static_cast<int>(mode);
-    resetSnapshotState();
+    resetSnapshotState(true);
 }
 
 void CameraWorker::captureBackground() {
@@ -113,16 +114,18 @@ void CameraWorker::setPpm(double ppmValue) {
 
 
 
-void CameraWorker::resetSnapshotState() {
-    QMutexLocker locker(&m_mutex);
-    m_stableFrameCount = 0;
-    m_hasMeasuredCurrentObject = false;
-    m_lastCentroid = cv::Point(0, 0);
-    m_isRenderingSnapshot = false;
-    if (!m_lastProcessedFrame.empty()) {
-        m_lastProcessedFrame.release();
+void CameraWorker::resetSnapshotState(bool forceStatusUpdate) {
+    bool stateChanged = false;
+    {
+        QMutexLocker locker(&m_mutex);
+        stateChanged = m_stableFrameCount != 0 || m_hasMeasuredCurrentObject ||
+                       m_lastCentroid != cv::Point(0, 0);
+        m_stableFrameCount = 0;
+        m_hasMeasuredCurrentObject = false;
+        m_lastCentroid = cv::Point(0, 0);
     }
-    emit statusUpdated("Waiting for object...");
+    // Avoid flooding the GUI event queue with this signal on every empty frame.
+    if (forceStatusUpdate || stateChanged) emit statusUpdated("Waiting for object...");
 }
 
 
@@ -226,8 +229,6 @@ void CameraWorker::run() {
         qDebug() << "DEBUG: Hikrobot Camera Streaming started successfully.";
         emit statusUpdated("Hikrobot Camera Streaming...");
     }
-    m_stopWatch.start();
-    m_uiTimer.start();
     // Keep thread alive while running
     while (true) {
         {
@@ -275,87 +276,93 @@ void __stdcall CameraWorker::ImageCallBackEx(unsigned char *pData, MV_FRAME_OUT_
 void CameraWorker::handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFrameInfo) {
     if (!pData || !pFrameInfo) return;
 
-    // 1. Top-Level Throttle to 50ms (~20 FPS) exactly like C#
-    if (m_stopWatch.isValid() && m_stopWatch.elapsed() < 50) {
-        return;
-    }
-    m_stopWatch.restart();
+    using Clock = std::chrono::steady_clock;
+    const long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now().time_since_epoch()).count();
+    long long previousUiMs = m_lastUiFrameMs.load(std::memory_order_relaxed);
+    const bool renderUi = nowMs - previousUiMs >= 33 &&
+        m_lastUiFrameMs.compare_exchange_strong(previousUiMs, nowMs, std::memory_order_relaxed);
 
-    // 2. Convert Pixel Formats
+    bool captureRequested = false;
+    bool calibrationRequested = false;
+    bool analysisEnabled = false;
+    {
+        QMutexLocker locker(&m_mutex);
+        captureRequested = m_captureFlag;
+        calibrationRequested = m_calibrationFlag;
+        analysisEnabled = !m_backgroundGray.empty() && m_mode != MeasurementMode::None;
+    }
+
+    // Reserve the analysis slot before copying/converting a frame. Busy frames are
+    // still eligible for UI display, but they do not allocate redundant work buffers.
+    const bool runAnalysis = analysisEnabled && !m_processingFrame.exchange(true);
+    if (!renderUi && !runAnalysis && !captureRequested && !calibrationRequested) return;
+
     cv::Mat matImage;
     if (pFrameInfo->enPixelType == PixelType_Gvsp_Mono8) {
         matImage = cv::Mat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC1, pData).clone();
-    }
-    else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerRG8 ||
-             pFrameInfo->enPixelType == PixelType_Gvsp_BayerGR8 ||
-             pFrameInfo->enPixelType == PixelType_Gvsp_BayerGB8 ||
-             pFrameInfo->enPixelType == PixelType_Gvsp_BayerBG8) {
-        cv::Mat bayerMat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC1, pData);
-        int cvBayerCode = cv::COLOR_BayerRG2BGR;
-        if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerGR8) cvBayerCode = cv::COLOR_BayerGR2BGR;
-        else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerGB8) cvBayerCode = cv::COLOR_BayerGB2BGR;
-        else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerBG8) cvBayerCode = cv::COLOR_BayerBG2BGR;
-        cv::cvtColor(bayerMat, matImage, cvBayerCode);
-    }
-    else if (pFrameInfo->enPixelType == PixelType_Gvsp_RGB8_Packed) {
-        cv::Mat rgbMat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC3, pData);
+    } else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerRG8 ||
+               pFrameInfo->enPixelType == PixelType_Gvsp_BayerGR8 ||
+               pFrameInfo->enPixelType == PixelType_Gvsp_BayerGB8 ||
+               pFrameInfo->enPixelType == PixelType_Gvsp_BayerBG8) {
+        const cv::Mat bayerMat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC1, pData);
+        int conversion = cv::COLOR_BayerRG2BGR;
+        if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerGR8) conversion = cv::COLOR_BayerGR2BGR;
+        else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerGB8) conversion = cv::COLOR_BayerGB2BGR;
+        else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerBG8) conversion = cv::COLOR_BayerBG2BGR;
+        cv::cvtColor(bayerMat, matImage, conversion);
+    } else if (pFrameInfo->enPixelType == PixelType_Gvsp_RGB8_Packed) {
+        const cv::Mat rgbMat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC3, pData);
         cv::cvtColor(rgbMat, matImage, cv::COLOR_RGB2BGR);
-    }
-    else if (pFrameInfo->enPixelType == PixelType_Gvsp_BGR8_Packed) {
+    } else if (pFrameInfo->enPixelType == PixelType_Gvsp_BGR8_Packed) {
         matImage = cv::Mat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC3, pData).clone();
     } else {
+        if (runAnalysis) m_processingFrame.store(false);
         qWarning() << "Unsupported camera pixel type:" << pFrameInfo->enPixelType;
         return;
     }
 
-    if (matImage.empty()) return;
+    if (matImage.empty()) {
+        if (runAnalysis) m_processingFrame.store(false);
+        return;
+    }
 
     cv::Mat processingCopy;
-    cv::Mat displayMat;
-    bool doProcess = false;
-
-    // 3. Safely Lock, Copy, and Handle Background/Calibration (Equivalent to C# lock(frameLock))
     {
         QMutexLocker locker(&m_mutex);
         m_latestFrame = matImage.clone();
 
         if (m_captureFlag) {
-            cv::imwrite("Blank_Bg.png", m_latestFrame);
             cv::Mat gray;
-            if (toGray8(m_latestFrame, gray)) {
+            if (toGray8(matImage, gray)) {
                 cv::medianBlur(gray, m_backgroundGray, 7);
-                m_captureFlag = false;
+                cv::imwrite("Blank_Bg.png", gray);
                 emit statusUpdated("Background Captured!");
             } else {
-                m_captureFlag = false;
                 emit statusUpdated("Background capture failed: unsupported image format");
             }
+            m_captureFlag = false;
         }
 
         if (m_calibrationFlag) {
-            cv::Mat calibCopy = m_latestFrame.clone();
-            doCalibration(calibCopy);
+            cv::Mat calibrationFrame = matImage.clone();
+            doCalibration(calibrationFrame);
             m_calibrationFlag = false;
         }
 
-        // Prepare the async processing copy
-        if (!m_backgroundGray.empty() && m_mode != MeasurementMode::None) {
-            processingCopy = m_latestFrame.clone();
-            doProcess = true;
-        }
-
-        // Determine what to show on the UI (Snapshot vs Live)
-        if (m_isRenderingSnapshot && !m_lastProcessedFrame.empty()) {
-            displayMat = m_lastProcessedFrame.clone();
-        } else {
-            displayMat = m_latestFrame.clone();
+        if (runAnalysis && !m_backgroundGray.empty() && m_mode != MeasurementMode::None) {
+            processingCopy = matImage.clone();
         }
     }
 
-    // 4. HIGH-SPEED ALGORITHM PROCESSING ENGINE (Equivalent to C# Task.Run)
-    if (doProcess && !processingCopy.empty() && !m_processingFrame.exchange(true)) {
-        // Keep at most one analysis task in flight. Queuing every camera frame makes
-        // measurements stale and allows several tasks to race on tracking state.
+    // UI delivery is independent from analysis and always uses the current live
+    // frame; measurement no longer replaces the stream with a frozen snapshot.
+    if (renderUi) {
+        const QImage image = matToQImage(matImage);
+        if (!image.isNull()) emit frameReady(image);
+    }
+
+    if (runAnalysis && !processingCopy.empty()) {
         m_processingFuture = QtConcurrent::run([this, processingCopy]() {
             try {
                 cv::Mat frameToProcess = processingCopy;
@@ -363,17 +370,17 @@ void CameraWorker::handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFram
             } catch (const cv::Exception &error) {
                 qWarning() << "OpenCV frame-processing error:" << error.what();
                 emit statusUpdated("Image processing failed");
+            } catch (...) {
+                qWarning() << "Unexpected frame-processing error";
+                emit statusUpdated("Image processing failed");
             }
             m_processingFrame.store(false);
         });
-    }
-
-    // 5. UNIFIED DISPLAY RENDERING PIPELINE (Equivalent to C# BeginInvoke)
-    QImage qimg = matToQImage(displayMat);
-    if (!qimg.isNull()) {
-        emit frameReady(qimg);
+    } else if (runAnalysis) {
+        m_processingFrame.store(false);
     }
 }
+
 void CameraWorker::doCalibration(cv::Mat &src)
 {
     if (src.empty()) return;
@@ -512,17 +519,6 @@ void CameraWorker::triggerAutoMeasurement(cv::Mat &frame) {
     qDebug() << "DEBUG: [triggerAutoMeasurement] Extracted L:" << extractedLength << " W:" << extractedWidth;
     emit measurementResult(cvDisplayString, extractedLength, extractedWidth);
 
-    // SAVE FROZEN OVERLAY SNAPSHOT
-    {
-        QMutexLocker locker(&m_mutex);
-        if (m_lastProcessedFrame.empty()) {
-            m_lastProcessedFrame = cv::Mat();
-        }
-        frame.clone().copyTo(m_lastProcessedFrame);
-        m_isRenderingSnapshot = true;
-        qDebug() << "DEBUG: [triggerAutoMeasurement] Saved frozen snapshot and activated m_isRenderingSnapshot = true.";
-    }
-
     // ... (Keep the rest of your SQLite / GPIO logic down here exactly as it is) ...
     qDebug() << "DEBUG: [triggerAutoMeasurement] Finished processing database/GPIO.";
 }
@@ -583,7 +579,6 @@ void CameraWorker::processFrame(cv::Mat &frame) {
                         if (dist > MOVEMENT_THRESHOLD) {
                             m_stableFrameCount = 0;
                             m_hasMeasuredCurrentObject = false;
-                            m_isRenderingSnapshot = false; // Reset snapshot instantly
                             emit statusUpdated("Object moving...");
                         } else {
                             if (!m_hasMeasuredCurrentObject) {
@@ -739,7 +734,6 @@ QString CameraWorker::measureGeneral(cv::Mat &src) {
     //cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
     //cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
 
-    cv::imwrite("Box_Shape_Result.png", src);
     return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(boxLengthMM, 0, 'f', 2).arg(boxWidthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
 }
 
@@ -821,7 +815,6 @@ QString CameraWorker::measureMarquise(cv::Mat &src) {
     //cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
     //cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
 
-    cv::imwrite("Marquise_Result.png", src);
     return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
 }
 
@@ -914,7 +907,6 @@ QString CameraWorker::measureHeart(cv::Mat &src) {
     //cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
     //cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
 
-    cv::imwrite("Heart_Result.png", src);
     return QString("Length : %1 mm\nWidth  : %2 mm\nDip    : %3 mm\nL/W Ratio : %4").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(dipDepthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
 }
 
@@ -999,7 +991,6 @@ QString CameraWorker::measurePear(cv::Mat &src) {
     //cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
     //cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
 
-    cv::imwrite("Pear_Result.png", src);
     return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
 }
 
@@ -1123,8 +1114,6 @@ QString CameraWorker::measureOval(cv::Mat &src) {
     cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), cv::Point(center.x + 25, center.y - 20), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
     cv::putText(src, QString("W: %1mm").arg(widthMM, 0, 'f', 2).toStdString(), cv::Point(widStart.x + 15, widStart.y + 25), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
 
-    cv::imwrite("ovel_Result.png", src);
-    qDebug() << "DEBUG: [measureOval] Finished writing ovel_Result.png and returning string.";
 
     return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
 }
@@ -1333,7 +1322,6 @@ QString CameraWorker::measurePolygon(cv::Mat &src) {
         cv::putText(src, QString("%1°").arg(angle, 0, 'f', 1).toStdString(), cv::Point(current.x + 10, current.y), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
     }
 
-    cv::imwrite("Polygon_Result.png", src);
     return QString("Length: %1 mm\nWidth : %2 mm\n").arg(generalLengthMM, 0, 'f', 2).arg(generalWidthMM, 0, 'f', 2) + angleString;
 }
 
@@ -1398,7 +1386,6 @@ QString CameraWorker::measureCustom(cv::Mat &src) {
     //cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
     //cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
 
-    cv::imwrite("CUSTOMS.png", src);
     return QString("Length: %1\nWidth: %2").arg(lengthVal, 0, 'f', 2).arg(widthVal, 0, 'f', 2);
 }
 
@@ -1495,8 +1482,6 @@ QString CameraWorker::measureRound(cv::Mat &src) {
             cv::Point textPosition(std::round(center.x) + 15, std::round(center.y) + 5);
             cv::putText(src, resultStr.toStdString(), textPosition, cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
 
-            cv::imwrite("Circle.png", src);
-            qDebug() << "DEBUG: [measureRound] Overlays drawn and image saved as Circle.png. Returning:" << resultStr;
 
             return resultStr;
         } else {
