@@ -69,6 +69,15 @@ CameraWorker::CameraWorker(QObject *parent)
       m_stableFrameCount(0), m_hasMeasuredCurrentObject(false), m_devHandle(nullptr)
 {
     qDebug() << "DEBUG: CameraWorker constructor called.";
+    QSettings settings("MetricScope", "Settings");
+    bool ppmOk = false;
+    const double savedPpm = settings.value("ppm", 100.0).toDouble(&ppmOk);
+    if (ppmOk && std::isfinite(savedPpm) && savedPpm >= 0.1 && savedPpm <= 2000.0) {
+        m_ppm = savedPpm;
+    } else {
+        qWarning() << "Ignoring invalid saved pixels-per-mm value:" << savedPpm;
+        m_ppm = 100.0;
+    }
     m_backgroundGray = cv::imread("Blank_Bg.png", cv::IMREAD_GRAYSCALE);
     if (!m_backgroundGray.empty()) {
         cv::medianBlur(m_backgroundGray, m_backgroundGray, 7);
@@ -402,8 +411,13 @@ void CameraWorker::doCalibration(cv::Mat &src)
     if (src.empty()) return;
 
     QSettings settings("MetricScope", "Settings");
-    double physicalDiameter = settings.value("calibval", 10.0).toDouble();
-    if (physicalDiameter <= 0) return;
+    bool diameterOk = false;
+    const double physicalDiameter = settings.value("calibval", 10.0).toDouble(&diameterOk);
+    if (!diameterOk || !std::isfinite(physicalDiameter) ||
+        physicalDiameter < 1.0 || physicalDiameter > 100.0) {
+        emit statusUpdated("Calibration failed: diameter must be 1 to 100 mm");
+        return;
+    }
 
     cv::Mat gray, blur, thresh;
     if (!toGray8(src, gray) || !ensureBgr8(src)) {
@@ -421,29 +435,53 @@ void CameraWorker::doCalibration(cv::Mat &src)
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
-    if (!contours.empty()) {
-        const auto &largestContour = *std::max_element(contours.begin(), contours.end(),
-            [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) {
-                return cv::contourArea(a) < cv::contourArea(b);
-            });
+    int bestIndex = -1;
+    double bestArea = 0.0;
+    cv::Point2f bestCenter;
+    float bestRadius = 0.0f;
+    for (size_t index = 0; index < contours.size(); ++index) {
+        const double area = cv::contourArea(contours[index]);
+        if (area <= bestArea) continue;
+
+        const cv::Rect bounds = cv::boundingRect(contours[index]);
+        const bool touchesBorder = bounds.x <= 2 || bounds.y <= 2 ||
+            bounds.br().x >= src.cols - 2 || bounds.br().y >= src.rows - 2;
+        if (touchesBorder) continue;
 
         cv::Point2f center;
-        float radius = 0;
-        cv::minEnclosingCircle(largestContour, center, radius);
+        float radius = 0.0f;
+        cv::minEnclosingCircle(contours[index], center, radius);
+        if (radius < 20.0f) continue;
 
-        if (radius > 50)
-        {
-            double calculatedPpm = (radius * 2.0) / physicalDiameter;
-            settings.setValue("ppm", calculatedPpm);
-            setPpm(calculatedPpm);
+        const double enclosingArea = CV_PI * radius * radius;
+        const double circleFill = enclosingArea > 0.0 ? area / enclosingArea : 0.0;
+        if (circleFill < 0.70 || circleFill > 1.05) continue;
 
-            cv::circle(src, cv::Point(std::round(center.x), std::round(center.y)), std::round(radius), cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-            cv::circle(src, cv::Point(std::round(center.x), std::round(center.y)), 3, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
-            cv::imwrite("calib_result.png", src);
+        bestIndex = static_cast<int>(index);
+        bestArea = area;
+        bestCenter = center;
+        bestRadius = radius;
+    }
 
-            emit statusUpdated("Calibration complete");
+    if (bestIndex >= 0) {
+        const double calculatedPpm = (bestRadius * 2.0) / physicalDiameter;
+        if (!std::isfinite(calculatedPpm) || calculatedPpm < 0.1 || calculatedPpm > 2000.0) {
+            emit statusUpdated("Calibration failed: calculated scale is invalid");
             return;
         }
+
+        settings.setValue("ppm", calculatedPpm);
+        settings.sync();
+        setPpm(calculatedPpm);
+
+        cv::circle(src, cv::Point(cvRound(bestCenter.x), cvRound(bestCenter.y)),
+                   cvRound(bestRadius), cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+        cv::circle(src, cv::Point(cvRound(bestCenter.x), cvRound(bestCenter.y)),
+                   3, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
+        cv::imwrite("calib_result.png", src);
+
+        emit statusUpdated(QString("Calibration complete: %1 px/mm").arg(calculatedPpm, 0, 'f', 3));
+        return;
     }
     emit statusUpdated("Calibration Not Done - No Circle Found");
 }
@@ -652,9 +690,13 @@ void CameraWorker::requestCalibration() {
 }
 
 double CameraWorker::getPpm() {
-    QSettings settings("MetricScope", "Settings");
-    double p = settings.value("ppm", 1.0).toDouble();
-    return (p <= 0) ? 1.0 : p;
+    QMutexLocker locker(&m_mutex);
+    if (!std::isfinite(m_ppm) || m_ppm < 0.1 || m_ppm > 2000.0) {
+        qWarning() << "Invalid pixels-per-mm value; using safe default:" << m_ppm;
+        return 100.0;
+    }
+    qDebug() << "Measurement calibration scale:" << m_ppm << "px/mm";
+    return m_ppm;
 }
 
 double CameraWorker::applyVariation(double rawMeasurementMM, bool isLength) {
@@ -665,8 +707,12 @@ double CameraWorker::applyVariation(double rawMeasurementMM, bool isLength) {
     QSettings settings("MetricScope", "Settings");
     QString regKey = isLength ? QString("LenVar_%1").arg(rangeIndex) : QString("WidVar_%1").arg(rangeIndex);
 
-    double variation = settings.value(regKey, 0.0).toDouble();
-    return rawMeasurementMM + variation;
+    const double variation = settings.value(regKey, 0.0).toDouble();
+    const double correctedMeasurement = rawMeasurementMM + variation;
+    qDebug() << "Measurement correction:" << regKey
+             << "raw" << rawMeasurementMM << "mm, offset" << variation
+             << "mm, result" << correctedMeasurement << "mm";
+    return correctedMeasurement;
 }
 
 void CameraWorker::triggerPiGpioOutput(int boxNumber) {
