@@ -765,8 +765,8 @@ QString CameraWorker::measureGeneral(cv::Mat &src) {
     cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
 
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
-    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
     cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
 
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
@@ -831,6 +831,7 @@ QString CameraWorker::measureMarquise(cv::Mat &src) {
     cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
 
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
     cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
 
     std::vector<std::vector<cv::Point>> contours;
@@ -839,6 +840,8 @@ QString CameraWorker::measureMarquise(cv::Mat &src) {
 
     const auto &largestContour = *std::max_element(contours.begin(), contours.end(),
         [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
+
+    if (cv::contourArea(largestContour) < 800.0) return "No Object Detected (Noise Ignored)";
 
     std::vector<cv::Point> hull;
     cv::convexHull(largestContour, hull);
@@ -911,6 +914,12 @@ QString CameraWorker::measureHeart(cv::Mat &src) {
     cv::GaussianBlur(gray, blur, cv::Size(3, 3), 0);
     cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
 
+    // Opening removes isolated dust and narrow dust-to-object bridges; closing
+    // restores small gaps in the actual silhouette before contour extraction.
+    const cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
+
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
     if (contours.empty()) return "No Shape Found";
@@ -918,6 +927,7 @@ QString CameraWorker::measureHeart(cv::Mat &src) {
     const auto &largestContour = *std::max_element(contours.begin(), contours.end(),
         [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
 
+    if (cv::contourArea(largestContour) < 800.0) return "No Object Detected (Noise Ignored)";
     if (largestContour.size() < 5) return "Shape too simple";
 
     std::vector<int> hullIndices;
@@ -1003,8 +1013,9 @@ QString CameraWorker::measurePear(cv::Mat &src) {
     cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
     cv::GaussianBlur(gray, blurred, cv::Size(5, 5), 0);
     cv::threshold(blurred, binary, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
-    cv::morphologyEx(binary, binary, cv::MORPH_CLOSE,
-                     cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3)));
+    const cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, kernel);
 
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
@@ -1088,8 +1099,8 @@ QString CameraWorker::measureOval(cv::Mat &src) {
     }
 
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
-    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
     cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
 
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
@@ -1274,8 +1285,8 @@ QString CameraWorker::measurePolygon(cv::Mat &src) {
     cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
 
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
-    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
     cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
 
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
@@ -1496,8 +1507,8 @@ QString CameraWorker::measureRound(cv::Mat &src) {
     qDebug() << "DEBUG: [measureRound] Applied Otsu Thresholding.";
 
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
-    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
     cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
 
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
