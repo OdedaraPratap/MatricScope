@@ -6,8 +6,6 @@
 #include <QFrame>
 #include <QDoubleValidator>
 #include <QSettings>
-#include <QMessageBox>
-#include <QLocale>
 
 CalibrationDialog::CalibrationDialog(QWidget *parent) : QDialog(parent)
 {
@@ -66,9 +64,8 @@ CalibrationDialog::CalibrationDialog(QWidget *parent) : QDialog(parent)
     txtCalib->setAlignment(Qt::AlignCenter);
 
     // Qt Validator: Replaces your C# KeyPress event. Only allows numbers and one decimal point!
-    QDoubleValidator *validator = new QDoubleValidator(1.0, 100.0, 3, this);
+    QDoubleValidator *validator = new QDoubleValidator(0.0, 999.0, 3, this);
     validator->setNotation(QDoubleValidator::StandardNotation);
-    validator->setLocale(QLocale::c());
     txtCalib->setValidator(validator);
 
     // Load last used calibration value
@@ -97,19 +94,11 @@ CalibrationDialog::CalibrationDialog(QWidget *parent) : QDialog(parent)
 
 void CalibrationDialog::onSaveClicked()
 {
-    bool ok = false;
-    const double diameterMm = txtCalib->text().toDouble(&ok);
-    if (!ok || diameterMm < 1.0 || diameterMm > 100.0) {
-        QMessageBox::warning(this, "Invalid diameter",
-                             "Enter the calibration circle diameter from 1 to 100 mm.");
-        txtCalib->setFocus();
-        txtCalib->selectAll();
-        return;
-    }
+    if (txtCalib->text().isEmpty()) return;
 
+    // Write to QSettings (Replaces ModifyRegistry)
     QSettings settings("MetricScope", "Settings");
-    settings.setValue("calibval", diameterMm);
-    settings.sync();
+    settings.setValue("calibval", txtCalib->text());
 
     // Tell the main window/camera thread to execute the visual calibration
     emit calibrationRequested();

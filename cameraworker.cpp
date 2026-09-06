@@ -69,15 +69,6 @@ CameraWorker::CameraWorker(QObject *parent)
       m_stableFrameCount(0), m_hasMeasuredCurrentObject(false), m_devHandle(nullptr)
 {
     qDebug() << "DEBUG: CameraWorker constructor called.";
-    QSettings settings("MetricScope", "Settings");
-    bool ppmOk = false;
-    const double savedPpm = settings.value("ppm", 100.0).toDouble(&ppmOk);
-    if (ppmOk && std::isfinite(savedPpm) && savedPpm >= 0.1 && savedPpm <= 2000.0) {
-        m_ppm = savedPpm;
-    } else {
-        qWarning() << "Ignoring invalid saved pixels-per-mm value:" << savedPpm;
-        m_ppm = 100.0;
-    }
     m_backgroundGray = cv::imread("Blank_Bg.png", cv::IMREAD_GRAYSCALE);
     if (!m_backgroundGray.empty()) {
         cv::medianBlur(m_backgroundGray, m_backgroundGray, 7);
@@ -411,77 +402,42 @@ void CameraWorker::doCalibration(cv::Mat &src)
     if (src.empty()) return;
 
     QSettings settings("MetricScope", "Settings");
-    bool diameterOk = false;
-    const double physicalDiameter = settings.value("calibval", 10.0).toDouble(&diameterOk);
-    if (!diameterOk || !std::isfinite(physicalDiameter) ||
-        physicalDiameter < 1.0 || physicalDiameter > 100.0) {
-        emit statusUpdated("Calibration failed: diameter must be 1 to 100 mm");
-        return;
-    }
+    const double physicalDiameter = settings.value("calibval", 10.0).toDouble();
+    if (physicalDiameter <= 0.0) return;
 
-    cv::Mat gray, blur, thresh;
-    if (!toGray8(src, gray) || !ensureBgr8(src)) {
-        emit statusUpdated("Calibration failed: unsupported image format");
-        return;
-    }
-    cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
+    cv::Mat gray, blurred, binary;
+    if (!toGray8(src, gray) || !ensureBgr8(src)) return;
+    cv::GaussianBlur(gray, blurred, cv::Size(5, 5), 0);
+    cv::threshold(blurred, binary, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
 
-    cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
-
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
-    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
-    cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+    const cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+    cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, kernel);
+    cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel);
 
     std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
-    int bestIndex = -1;
-    double bestArea = 0.0;
-    cv::Point2f bestCenter;
-    float bestRadius = 0.0f;
-    for (size_t index = 0; index < contours.size(); ++index) {
-        const double area = cv::contourArea(contours[index]);
-        if (area <= bestArea) continue;
-
-        const cv::Rect bounds = cv::boundingRect(contours[index]);
-        const bool touchesBorder = bounds.x <= 2 || bounds.y <= 2 ||
-            bounds.br().x >= src.cols - 2 || bounds.br().y >= src.rows - 2;
-        if (touchesBorder) continue;
+    cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    if (!contours.empty()) {
+        const auto &largestContour = *std::max_element(contours.begin(), contours.end(),
+            [](const std::vector<cv::Point>& first, const std::vector<cv::Point>& second) {
+                return cv::contourArea(first) < cv::contourArea(second);
+            });
 
         cv::Point2f center;
         float radius = 0.0f;
-        cv::minEnclosingCircle(contours[index], center, radius);
-        if (radius < 20.0f) continue;
+        cv::minEnclosingCircle(largestContour, center, radius);
+        if (radius > 50.0f) {
+            const double calculatedPpm = (radius * 2.0) / physicalDiameter;
+            settings.setValue("ppm", calculatedPpm);
+            setPpm(calculatedPpm);
 
-        const double enclosingArea = CV_PI * radius * radius;
-        const double circleFill = enclosingArea > 0.0 ? area / enclosingArea : 0.0;
-        if (circleFill < 0.70 || circleFill > 1.05) continue;
-
-        bestIndex = static_cast<int>(index);
-        bestArea = area;
-        bestCenter = center;
-        bestRadius = radius;
-    }
-
-    if (bestIndex >= 0) {
-        const double calculatedPpm = (bestRadius * 2.0) / physicalDiameter;
-        if (!std::isfinite(calculatedPpm) || calculatedPpm < 0.1 || calculatedPpm > 2000.0) {
-            emit statusUpdated("Calibration failed: calculated scale is invalid");
+            cv::circle(src, cv::Point(cvRound(center.x), cvRound(center.y)),
+                       cvRound(radius), cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+            cv::circle(src, cv::Point(cvRound(center.x), cvRound(center.y)),
+                       3, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
+            cv::imwrite("calib_result.png", src);
+            emit statusUpdated("Calibration complete");
             return;
         }
-
-        settings.setValue("ppm", calculatedPpm);
-        settings.sync();
-        setPpm(calculatedPpm);
-
-        cv::circle(src, cv::Point(cvRound(bestCenter.x), cvRound(bestCenter.y)),
-                   cvRound(bestRadius), cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-        cv::circle(src, cv::Point(cvRound(bestCenter.x), cvRound(bestCenter.y)),
-                   3, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
-        cv::imwrite("calib_result.png", src);
-
-        emit statusUpdated(QString("Calibration complete: %1 px/mm").arg(calculatedPpm, 0, 'f', 3));
-        return;
     }
     emit statusUpdated("Calibration Not Done - No Circle Found");
 }
@@ -599,86 +555,92 @@ void CameraWorker::triggerAutoMeasurement(cv::Mat &frame) {
 
 
 void CameraWorker::processFrame(cv::Mat &frame) {
-    cv::Mat liveGray, diff, thresh;
+    if (frame.empty()) return;
 
-    if (!toGray8(frame, liveGray)) return;
-    cv::medianBlur(liveGray, liveGray, 7);
-
-    cv::Mat bgCopy;
+    cv::Mat background;
     {
         QMutexLocker locker(&m_mutex);
-        bgCopy = m_backgroundGray.clone();
+        background = m_backgroundGray;
     }
+    if (background.empty() || !sameImageGeometry(background, frame)) return;
 
-    if (bgCopy.empty() || !sameImageGeometry(bgCopy, liveGray)) return;
+    // Object stability does not need full camera resolution. Track on a bounded
+    // working image, then run the selected measurement once on the original frame.
+    // This preserves all measurement geometry while substantially reducing the
+    // per-frame blur, subtraction, threshold, and contour workload.
+    const int longestSide = std::max(frame.cols, frame.rows);
+    const double trackingScale = longestSide > 960 ? 960.0 / longestSide : 1.0;
+    cv::Mat fullGray;
+    if (!toGray8(frame, fullGray)) return;
 
-    cv::absdiff(bgCopy, liveGray, diff);
-    cv::threshold(diff, thresh, m_thresholdValue, 255, cv::THRESH_BINARY);
-
-    if (cv::countNonZero(thresh) > 1250) {
-        std::vector<std::vector<cv::Point>> contours;
-        cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
-        if (!contours.empty()) {
-            int bestIdx = -1;
-            double maxArea = 0;
-
-            for (size_t i = 0; i < contours.size(); ++i) {
-                double area = cv::contourArea(contours[i]);
-                cv::Rect rect = cv::boundingRect(contours[i]);
-
-                // Ignore Hikrobot edge artifacts
-                bool touchesBorder = (rect.x <= 2 || rect.y <= 2 ||
-                                      rect.x + rect.width >= frame.cols - 2 ||
-                                      rect.y + rect.height >= frame.rows - 2);
-
-                if (!touchesBorder && area > maxArea) {
-                    maxArea = area;
-                    bestIdx = static_cast<int>(i);
-                }
-            }
-
-            if (bestIdx != -1) {
-                cv::Rect boundingBox = cv::boundingRect(contours[bestIdx]);
-                double aspect = static_cast<double>(boundingBox.width) / boundingBox.height;
-
-                if (aspect > 0.22 && aspect < 4.5 && maxArea > 800) {
-                    cv::Moments mu = cv::moments(contours[bestIdx], true);
-                    if (mu.m00 > 0) {
-                        cv::Point currentCentroid(mu.m10 / mu.m00, mu.m01 / mu.m00);
-
-                        QMutexLocker locker(&m_mutex); // Lock tracking variables
-                        double dist = std::hypot(currentCentroid.x - m_lastCentroid.x, currentCentroid.y - m_lastCentroid.y);
-
-                        if (dist > MOVEMENT_THRESHOLD) {
-                            m_stableFrameCount = 0;
-                            m_hasMeasuredCurrentObject = false;
-                            m_measurementOverlay.release();
-                            m_measurementOverlayMask.release();
-                            emit statusUpdated("Object moving...");
-                        } else {
-                            if (!m_hasMeasuredCurrentObject) {
-                                m_stableFrameCount++;
-                                if (m_stableFrameCount >= FRAMES_TO_STABILIZE) {
-                                    m_hasMeasuredCurrentObject = true;
-
-                                    cv::Mat isolatedFrame = frame.clone();
-
-                                    // Unlock before jumping into the heavy drawing function
-                                    locker.unlock();
-                                    triggerAutoMeasurement(isolatedFrame);
-                                    locker.relock();
-                                }
-                            }
-                        }
-                        m_lastCentroid = currentCentroid;
-                    }
-                }
-            }
-        }
+    cv::Mat liveGray;
+    cv::Mat trackingBackground;
+    if (trackingScale < 1.0) {
+        cv::resize(fullGray, liveGray, cv::Size(), trackingScale, trackingScale, cv::INTER_LINEAR);
+        cv::resize(background, trackingBackground, liveGray.size(), 0.0, 0.0, cv::INTER_LINEAR);
     } else {
-        resetSnapshotState();
+        liveGray = fullGray;
+        trackingBackground = background;
     }
+    int blurSize = std::max(3, cvRound(7.0 * trackingScale));
+    if (blurSize % 2 == 0) ++blurSize;
+    cv::medianBlur(liveGray, liveGray, blurSize);
+
+    cv::Mat difference;
+    cv::Mat binary;
+    cv::absdiff(trackingBackground, liveGray, difference);
+    cv::threshold(difference, binary, m_thresholdValue, 255, cv::THRESH_BINARY);
+
+    const double areaScale = trackingScale * trackingScale;
+    const int minimumForeground = std::max(50, cvRound(1250.0 * areaScale));
+    if (cv::countNonZero(binary) <= minimumForeground) {
+        resetSnapshotState();
+        return;
+    }
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    int bestIndex = -1;
+    double largestArea = 0.0;
+    for (size_t index = 0; index < contours.size(); ++index) {
+        const double area = cv::contourArea(contours[index]);
+        const cv::Rect bounds = cv::boundingRect(contours[index]);
+        const bool touchesBorder = bounds.x <= 2 || bounds.y <= 2 ||
+            bounds.br().x >= binary.cols - 2 || bounds.br().y >= binary.rows - 2;
+        if (!touchesBorder && area > largestArea) {
+            largestArea = area;
+            bestIndex = static_cast<int>(index);
+        }
+    }
+    if (bestIndex < 0 || largestArea / areaScale <= 800.0) return;
+
+    const cv::Rect bounds = cv::boundingRect(contours[bestIndex]);
+    if (bounds.height <= 0) return;
+    const double aspect = static_cast<double>(bounds.width) / bounds.height;
+    if (aspect <= 0.22 || aspect >= 4.5) return;
+
+    const cv::Moments moments = cv::moments(contours[bestIndex], true);
+    if (moments.m00 <= 0.0) return;
+    const cv::Point currentCentroid(
+        cvRound((moments.m10 / moments.m00) / trackingScale),
+        cvRound((moments.m01 / moments.m00) / trackingScale));
+
+    QMutexLocker locker(&m_mutex);
+    const double movement = cv::norm(currentCentroid - m_lastCentroid);
+    if (movement > MOVEMENT_THRESHOLD) {
+        m_stableFrameCount = 0;
+        m_hasMeasuredCurrentObject = false;
+        m_measurementOverlay.release();
+        m_measurementOverlayMask.release();
+        emit statusUpdated("Object moving...");
+    } else if (!m_hasMeasuredCurrentObject && ++m_stableFrameCount >= FRAMES_TO_STABILIZE) {
+        m_hasMeasuredCurrentObject = true;
+        cv::Mat measurementFrame = frame.clone();
+        locker.unlock();
+        triggerAutoMeasurement(measurementFrame);
+        locker.relock();
+    }
+    m_lastCentroid = currentCentroid;
 }
 // ============================================================================
 // HELPER METHODS
@@ -690,13 +652,9 @@ void CameraWorker::requestCalibration() {
 }
 
 double CameraWorker::getPpm() {
-    QMutexLocker locker(&m_mutex);
-    if (!std::isfinite(m_ppm) || m_ppm < 0.1 || m_ppm > 2000.0) {
-        qWarning() << "Invalid pixels-per-mm value; using safe default:" << m_ppm;
-        return 100.0;
-    }
-    qDebug() << "Measurement calibration scale:" << m_ppm << "px/mm";
-    return m_ppm;
+    QSettings settings("MetricScope", "Settings");
+    const double ppm = settings.value("ppm", 1.0).toDouble();
+    return ppm > 0.0 ? ppm : 1.0;
 }
 
 double CameraWorker::applyVariation(double rawMeasurementMM, bool isLength) {
@@ -705,14 +663,9 @@ double CameraWorker::applyVariation(double rawMeasurementMM, bool isLength) {
     if (rangeIndex < 0) rangeIndex = 0;
 
     QSettings settings("MetricScope", "Settings");
-    QString regKey = isLength ? QString("LenVar_%1").arg(rangeIndex) : QString("WidVar_%1").arg(rangeIndex);
-
-    const double variation = settings.value(regKey, 0.0).toDouble();
-    const double correctedMeasurement = rawMeasurementMM + variation;
-    qDebug() << "Measurement correction:" << regKey
-             << "raw" << rawMeasurementMM << "mm, offset" << variation
-             << "mm, result" << correctedMeasurement << "mm";
-    return correctedMeasurement;
+    const QString regKey = isLength ? QString("LenVar_%1").arg(rangeIndex)
+                                    : QString("WidVar_%1").arg(rangeIndex);
+    return rawMeasurementMM + settings.value(regKey, 0.0).toDouble();
 }
 
 void CameraWorker::triggerPiGpioOutput(int boxNumber) {
