@@ -123,6 +123,8 @@ void CameraWorker::resetSnapshotState(bool forceStatusUpdate) {
         m_stableFrameCount = 0;
         m_hasMeasuredCurrentObject = false;
         m_lastCentroid = cv::Point(0, 0);
+        m_measurementOverlay.release();
+        m_measurementOverlayMask.release();
     }
     // Avoid flooding the GUI event queue with this signal on every empty frame.
     if (forceStatusUpdate || stateChanged) emit statusUpdated("Waiting for object...");
@@ -328,6 +330,8 @@ void CameraWorker::handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFram
     }
 
     cv::Mat processingCopy;
+    cv::Mat measurementOverlay;
+    cv::Mat measurementOverlayMask;
     {
         QMutexLocker locker(&m_mutex);
         m_latestFrame = matImage.clone();
@@ -341,6 +345,8 @@ void CameraWorker::handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFram
             } else {
                 emit statusUpdated("Background capture failed: unsupported image format");
             }
+            m_measurementOverlay.release();
+            m_measurementOverlayMask.release();
             m_captureFlag = false;
         }
 
@@ -353,12 +359,22 @@ void CameraWorker::handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFram
         if (runAnalysis && !m_backgroundGray.empty() && m_mode != MeasurementMode::None) {
             processingCopy = matImage.clone();
         }
+        if (renderUi && sameImageGeometry(m_measurementOverlay, matImage) &&
+            sameImageGeometry(m_measurementOverlayMask, matImage)) {
+            measurementOverlay = m_measurementOverlay;
+            measurementOverlayMask = m_measurementOverlayMask;
+        }
     }
 
-    // UI delivery is independent from analysis and always uses the current live
-    // frame; measurement no longer replaces the stream with a frozen snapshot.
+    // Composite only the measurement graphics over the newest camera frame. This
+    // keeps contours, dimensions, and labels visible without freezing the image.
     if (renderUi) {
-        const QImage image = matToQImage(matImage);
+        cv::Mat displayImage = matImage;
+        if (!measurementOverlay.empty() && !measurementOverlayMask.empty() &&
+            ensureBgr8(displayImage)) {
+            measurementOverlay.copyTo(displayImage, measurementOverlayMask);
+        }
+        const QImage image = matToQImage(displayImage);
         if (!image.isNull()) emit frameReady(image);
     }
 
@@ -457,6 +473,8 @@ QImage CameraWorker::matToQImage(const cv::Mat &mat) {
 
 void CameraWorker::triggerAutoMeasurement(cv::Mat &frame) {
     qDebug() << "DEBUG: [triggerAutoMeasurement] Started. Mode =" << static_cast<int>(m_mode);
+    cv::Mat originalFrame = frame.clone();
+    if (!ensureBgr8(originalFrame)) return;
     QString cvDisplayString = "";
 
     switch (m_mode) {
@@ -486,8 +504,26 @@ void CameraWorker::triggerAutoMeasurement(cv::Mat &frame) {
         cvDisplayString.contains("No Shape") ||
         cvDisplayString.contains("No Valid"))
     {
-        qDebug() << "DEBUG: [triggerAutoMeasurement] Measurement failed or rejected. Aborting snapshot rendering.";
+        qDebug() << "DEBUG: [triggerAutoMeasurement] Measurement failed or rejected. Clearing live overlay.";
+        QMutexLocker locker(&m_mutex);
+        m_measurementOverlay.release();
+        m_measurementOverlayMask.release();
         return;
+    }
+
+    // Preserve only pixels drawn by the measurement function. The mask is later
+    // applied to current live frames, rather than displaying this old frame.
+    cv::Mat overlayMask;
+    if (ensureBgr8(frame) && sameImageGeometry(originalFrame, frame)) {
+        cv::Mat difference, differenceGray;
+        cv::absdiff(originalFrame, frame, difference);
+        cv::cvtColor(difference, differenceGray, cv::COLOR_BGR2GRAY);
+        cv::threshold(differenceGray, overlayMask, 1, 255, cv::THRESH_BINARY);
+    }
+    {
+        QMutexLocker locker(&m_mutex);
+        m_measurementOverlay = frame.clone();
+        m_measurementOverlayMask = overlayMask.clone();
     }
 
     qDebug() << "DEBUG: [triggerAutoMeasurement] Measurement valid. Parsing dimensions.";
@@ -579,6 +615,8 @@ void CameraWorker::processFrame(cv::Mat &frame) {
                         if (dist > MOVEMENT_THRESHOLD) {
                             m_stableFrameCount = 0;
                             m_hasMeasuredCurrentObject = false;
+                            m_measurementOverlay.release();
+                            m_measurementOverlayMask.release();
                             emit statusUpdated("Object moving...");
                         } else {
                             if (!m_hasMeasuredCurrentObject) {

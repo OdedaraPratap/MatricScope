@@ -97,6 +97,8 @@ private:
 
     cv::Mat m_backgroundGray;
     cv::Mat m_latestFrame;
+    cv::Mat m_measurementOverlay;
+    cv::Mat m_measurementOverlayMask;
     bool m_captureFlag = false;
     bool m_calibrationFlag = false;
     bool m_settingsChanged = false;
