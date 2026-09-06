@@ -950,86 +950,67 @@ QString CameraWorker::measureHeart(cv::Mat &src) {
 
 QString CameraWorker::measurePear(cv::Mat &src) {
     if (src.empty()) return "No Shape Found";
-    double ppm = getPpm();
+    const double ppm = getPpm();
     if (!ensureBgr8(src)) return "Error: Unsupported image format";
-    cv::Mat gray, blur, thresh;
-    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
-    cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
-    cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
 
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
-    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
+    cv::Mat gray, blurred, binary;
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray, blurred, cv::Size(5, 5), 0);
+    cv::threshold(blurred, binary, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+    cv::morphologyEx(binary, binary, cv::MORPH_CLOSE,
+                     cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3)));
 
     std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+    cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
     if (contours.empty()) return "No Shape Found";
 
-    const auto &largestContour = *std::max_element(contours.begin(), contours.end(),
-        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
+    const auto &contour = *std::max_element(contours.begin(), contours.end(),
+        [](const std::vector<cv::Point>& first, const std::vector<cv::Point>& second) {
+            return cv::contourArea(first) < cv::contourArea(second);
+        });
+    if (cv::contourArea(contour) < 800.0) return "No Object Detected (Noise Ignored)";
 
     std::vector<cv::Point> hull;
-    cv::convexHull(largestContour, hull);
+    cv::convexHull(contour, hull);
+    const cv::RotatedRect box = cv::minAreaRect(hull);
+    if (box.size.width <= 0.0f || box.size.height <= 0.0f) return "No Valid Object Found";
 
-    cv::Moments mu = cv::moments(hull);
-    cv::Point centroid(mu.m10 / mu.m00, mu.m01 / mu.m00);
+    cv::Point2f corners[4];
+    box.points(corners);
+    const cv::Point2f side01 = (corners[0] + corners[1]) * 0.5f;
+    const cv::Point2f side12 = (corners[1] + corners[2]) * 0.5f;
+    const cv::Point2f side23 = (corners[2] + corners[3]) * 0.5f;
+    const cv::Point2f side30 = (corners[3] + corners[0]) * 0.5f;
 
-    cv::Point pearTip = hull[0];
-    double maxDistToCentroid = 0;
-    for (const auto& p : hull) {
-        double dist = std::hypot(p.x - centroid.x, p.y - centroid.y);
-        if (dist > maxDistToCentroid) { maxDistToCentroid = dist; pearTip = p; }
+    cv::Point2f lengthStart, lengthEnd, widthStart, widthEnd;
+    if (cv::norm(side01 - side23) >= cv::norm(side12 - side30)) {
+        lengthStart = side01; lengthEnd = side23;
+        widthStart = side12; widthEnd = side30;
+    } else {
+        lengthStart = side12; lengthEnd = side30;
+        widthStart = side01; widthEnd = side23;
     }
 
-    double dirX = centroid.x - pearTip.x;
-    double dirY = centroid.y - pearTip.y;
-    double lenVector = std::hypot(dirX, dirY);
-    dirX /= (lenVector == 0 ? 1 : lenVector);
-    dirY /= (lenVector == 0 ? 1 : lenVector);
+    const double lengthPx = cv::norm(lengthEnd - lengthStart);
+    const double widthPx = cv::norm(widthEnd - widthStart);
+    const double lengthMM = applyVariation(lengthPx / ppm, true);
+    const double widthMM = applyVariation(widthPx / ppm, false);
+    const double ratio = widthMM > 0.0 ? lengthMM / widthMM : 0.0;
 
-    cv::Point pearBase = centroid;
-    double maxBaseProjection = 0;
-    for (const auto& p : hull) {
-        double projection = (p.x - pearTip.x) * dirX + (p.y - pearTip.y) * dirY;
-        if (projection > maxBaseProjection) {
-            maxBaseProjection = projection;
-            pearBase = cv::Point(pearTip.x + (int)(dirX * projection), pearTip.y + (int)(dirY * projection));
-        }
-    }
-
-    double maxWidthDist = 0;
-    cv::Point widthL(0, 0), widthR(0, 0);
-    for (size_t i = 0; i < hull.size(); i++) {
-        for (size_t j = i + 1; j < hull.size(); j++) {
-            double sX = hull[j].x - hull[i].x;
-            double sY = hull[j].y - hull[i].y;
-            double perpDistance = std::abs(sX * dirY - sY * dirX);
-            if (perpDistance > maxWidthDist) { maxWidthDist = perpDistance; widthL = hull[i]; widthR = hull[j]; }
-        }
-    }
-
-    double lengthMM = applyVariation(maxBaseProjection / ppm, true);
-    double widthMM = applyVariation(maxWidthDist / ppm, false);
-    double ratio = (widthMM == 0) ? 0 : lengthMM / widthMM;
-
-    cv::line(src, pearTip, pearBase, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
-    cv::line(src, widthL, widthR, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
-    cv::circle(src, centroid, 5, cv::Scalar(0, 165, 255), -1, cv::LINE_AA);
     std::vector<std::vector<cv::Point>> hullWrapper = { hull };
     cv::polylines(src, hullWrapper, true, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+    cv::line(src, lengthStart, lengthEnd, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
+    cv::line(src, widthStart, widthEnd, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+    cv::circle(src, box.center, 4, cv::Scalar(0, 165, 255), -1, cv::LINE_AA);
+    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(),
+                cv::Point(cvRound(box.center.x + 20), cvRound(box.center.y - 20)),
+                cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+    cv::putText(src, QString("W: %1mm").arg(widthMM, 0, 'f', 2).toStdString(),
+                cv::Point(cvRound(widthStart.x + 10), cvRound(widthStart.y + 20)),
+                cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
 
-    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), cv::Point(centroid.x + 25, centroid.y - 20), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
-    cv::putText(src, QString("W: %1mm").arg(widthMM, 0, 'f', 2).toStdString(), cv::Point(widthL.x + 15, widthL.y + 25), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
-
-    //cv::Mat printCanvas(src.size(), CV_8UC3, cv::Scalar(255, 255, 255));
-    //cv::polylines(printCanvas, hullWrapper, true, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
-    //cv::Rect cropRect = cv::boundingRect(hull);
-    //cropRect.x = std::max(0, cropRect.x - 15);
-    //cropRect.y = std::max(0, cropRect.y - 15);
-    //cropRect.width = std::min(printCanvas.cols - cropRect.x, cropRect.width + 30);
-    //cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
-    //cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
-
-    return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
+    return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3")
+        .arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
 }
 
 QString CameraWorker::measureOval(cv::Mat &src) {
@@ -1099,57 +1080,37 @@ QString CameraWorker::measureOval(cv::Mat &src) {
         return "No Valid Object Found";
     }
 
-    std::vector<cv::Point> hull;
-    cv::convexHull(bestContour, hull);
+    if (bestContour.size() < 5) return "No Valid Object Found";
 
-    cv::Point lenStart(0, 0), lenEnd(0, 0);
-    double maxLenDist = 0;
-    for (size_t i = 0; i < hull.size(); i++) {
-        for (size_t j = i + 1; j < hull.size(); j++) {
-            double d = std::hypot(hull[i].x - hull[j].x, hull[i].y - hull[j].y);
-            if (d > maxLenDist) {
-                maxLenDist = d;
-                lenStart = hull[i];
-                lenEnd = hull[j];
-            }
-        }
-    }
+    const cv::RotatedRect ellipse = cv::fitEllipse(bestContour);
+    const double lengthPx = std::max(ellipse.size.width, ellipse.size.height);
+    const double widthPx = std::min(ellipse.size.width, ellipse.size.height);
+    if (lengthPx <= 0.0 || widthPx <= 0.0) return "No Valid Object Found";
 
-    double maxWidthDist = 0;
-    cv::Point widStart(0, 0), widEnd(0, 0);
-    double axisX = lenEnd.x - lenStart.x;
-    double axisY = lenEnd.y - lenStart.y;
-    double axisLength = std::hypot(axisX, axisY);
+    // fitEllipse.angle follows the ellipse width axis. Rotate by 90 degrees when
+    // height is the major diameter so the displayed axes match the measurements.
+    double majorAngleDegrees = ellipse.angle;
+    if (ellipse.size.height >= ellipse.size.width) majorAngleDegrees += 90.0;
+    const double majorAngle = majorAngleDegrees * CV_PI / 180.0;
+    const cv::Point2f majorDirection(std::cos(majorAngle), std::sin(majorAngle));
+    const cv::Point2f minorDirection(-majorDirection.y, majorDirection.x);
+    const cv::Point2f lenStart = ellipse.center - majorDirection * static_cast<float>(lengthPx * 0.5);
+    const cv::Point2f lenEnd = ellipse.center + majorDirection * static_cast<float>(lengthPx * 0.5);
+    const cv::Point2f widStart = ellipse.center - minorDirection * static_cast<float>(widthPx * 0.5);
+    const cv::Point2f widEnd = ellipse.center + minorDirection * static_cast<float>(widthPx * 0.5);
 
-    for (size_t i = 0; i < hull.size(); i++) {
-        for (size_t j = i + 1; j < hull.size(); j++) {
-            double sX = hull[j].x - hull[i].x;
-            double sY = hull[j].y - hull[i].y;
-            double crossProduct = std::abs(sX * axisY - sY * axisX) / (axisLength == 0 ? 1 : axisLength);
-
-            if (crossProduct > maxWidthDist) {
-                maxWidthDist = crossProduct;
-                widStart = hull[i];
-                widEnd = hull[j];
-            }
-        }
-    }
-
-    double lengthMM = applyVariation(maxLenDist / ppm, true);
-    double widthMM = applyVariation(maxWidthDist / ppm, false);
-    double ratio = (widthMM == 0) ? 0 : lengthMM / widthMM;
-    cv::Point center((lenStart.x + lenEnd.x) / 2, (lenStart.y + lenEnd.y) / 2);
+    const double lengthMM = applyVariation(lengthPx / ppm, true);
+    const double widthMM = applyVariation(widthPx / ppm, false);
+    const double ratio = widthMM > 0.0 ? lengthMM / widthMM : 0.0;
 
     qDebug() << "DEBUG: [measureOval] Drawing lines... L:" << lengthMM << "W:" << widthMM;
 
     cv::line(src, lenStart, lenEnd, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
     cv::line(src, widStart, widEnd, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
-    cv::circle(src, center, 5, cv::Scalar(0, 165, 255), -1, cv::LINE_AA);
+    cv::ellipse(src, ellipse, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+    cv::circle(src, ellipse.center, 5, cv::Scalar(0, 165, 255), -1, cv::LINE_AA);
 
-    std::vector<std::vector<cv::Point>> hullWrapper = { hull };
-    cv::polylines(src, hullWrapper, true, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-
-    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), cv::Point(center.x + 25, center.y - 20), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), cv::Point(cvRound(ellipse.center.x + 25), cvRound(ellipse.center.y - 20)), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
     cv::putText(src, QString("W: %1mm").arg(widthMM, 0, 'f', 2).toStdString(), cv::Point(widStart.x + 15, widStart.y + 25), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
 
 
