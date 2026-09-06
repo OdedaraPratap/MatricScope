@@ -13,7 +13,55 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdlib>
+#include <chrono>
+#include <limits>
 #include <QtConcurrentRun>
+
+
+namespace {
+
+bool toGray8(const cv::Mat &source, cv::Mat &gray)
+{
+    if (source.empty() || source.depth() != CV_8U) return false;
+
+    switch (source.channels()) {
+    case 1:
+        gray = source.clone();
+        return true;
+    case 3:
+        cv::cvtColor(source, gray, cv::COLOR_BGR2GRAY);
+        return true;
+    case 4:
+        cv::cvtColor(source, gray, cv::COLOR_BGRA2GRAY);
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool ensureBgr8(cv::Mat &image)
+{
+    if (image.empty() || image.depth() != CV_8U) return false;
+    if (image.channels() == 3) return true;
+
+    cv::Mat converted;
+    if (image.channels() == 1) {
+        cv::cvtColor(image, converted, cv::COLOR_GRAY2BGR);
+    } else if (image.channels() == 4) {
+        cv::cvtColor(image, converted, cv::COLOR_BGRA2BGR);
+    } else {
+        return false;
+    }
+    image = converted;
+    return true;
+}
+
+bool sameImageGeometry(const cv::Mat &first, const cv::Mat &second)
+{
+    return first.rows == second.rows && first.cols == second.cols;
+}
+
+} // namespace
 
 CameraWorker::CameraWorker(QObject *parent)
     : QThread(parent), m_running(true), m_mutex(QMutex::Recursive),m_mode(MeasurementMode::None),
@@ -49,7 +97,7 @@ void CameraWorker::setMode(MeasurementMode mode) {
     QMutexLocker locker(&m_mutex);
     m_mode = mode;
     qDebug() << "DEBUG: MeasurementMode changed to:" << static_cast<int>(mode);
-    resetSnapshotState();
+    resetSnapshotState(true);
 }
 
 void CameraWorker::captureBackground() {
@@ -64,23 +112,22 @@ void CameraWorker::setPpm(double ppmValue) {
     qDebug() << "DEBUG: PPM updated to:" << m_ppm;
 }
 
-/*void CameraWorker::resetSnapshotState() {
-    m_stableFrameCount = 0;
-    m_hasMeasuredCurrentObject = false;
-    m_lastCentroid = cv::Point(0, 0);
-    emit statusUpdated("Waiting for object...");
-}*/
 
-void CameraWorker::resetSnapshotState() {
-    QMutexLocker locker(&m_mutex);
-    m_stableFrameCount = 0;
-    m_hasMeasuredCurrentObject = false;
-    m_lastCentroid = cv::Point(0, 0);
-    m_isRenderingSnapshot = false;
-    if (!m_lastProcessedFrame.empty()) {
-        m_lastProcessedFrame.release();
+
+void CameraWorker::resetSnapshotState(bool forceStatusUpdate) {
+    bool stateChanged = false;
+    {
+        QMutexLocker locker(&m_mutex);
+        stateChanged = m_stableFrameCount != 0 || m_hasMeasuredCurrentObject ||
+                       m_lastCentroid != cv::Point(0, 0);
+        m_stableFrameCount = 0;
+        m_hasMeasuredCurrentObject = false;
+        m_lastCentroid = cv::Point(0, 0);
+        m_measurementOverlay.release();
+        m_measurementOverlayMask.release();
     }
-    emit statusUpdated("Waiting for object...");
+    // Avoid flooding the GUI event queue with this signal on every empty frame.
+    if (forceStatusUpdate || stateChanged) emit statusUpdated("Waiting for object...");
 }
 
 
@@ -184,8 +231,6 @@ void CameraWorker::run() {
         qDebug() << "DEBUG: Hikrobot Camera Streaming started successfully.";
         emit statusUpdated("Hikrobot Camera Streaming...");
     }
-    m_stopWatch.start();
-    m_uiTimer.start();
     // Keep thread alive while running
     while (true) {
         {
@@ -216,6 +261,9 @@ void CameraWorker::run() {
         m_devHandle = nullptr;
         qDebug() << "DEBUG: Camera cleanup completed.";
     }
+    if (m_processingFuture.isRunning()) {
+        m_processingFuture.waitForFinished();
+    }
 }
 
 // Static SDK Callback Trampoline
@@ -227,225 +275,166 @@ void __stdcall CameraWorker::ImageCallBackEx(unsigned char *pData, MV_FRAME_OUT_
 }
 
 // Frame Processing Callback Worker
-/*void CameraWorker::handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFrameInfo) {
-    if (!pData || !pFrameInfo) {
-        qDebug() << "DEBUG: handleFrame received NULL pData or pFrameInfo!";
-        return;
+void CameraWorker::handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFrameInfo) {
+    if (!pData || !pFrameInfo) return;
+
+    using Clock = std::chrono::steady_clock;
+    const long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now().time_since_epoch()).count();
+    long long previousUiMs = m_lastUiFrameMs.load(std::memory_order_relaxed);
+    const bool renderUi = nowMs - previousUiMs >= 33 &&
+        m_lastUiFrameMs.compare_exchange_strong(previousUiMs, nowMs, std::memory_order_relaxed);
+
+    bool captureRequested = false;
+    bool calibrationRequested = false;
+    bool analysisEnabled = false;
+    {
+        QMutexLocker locker(&m_mutex);
+        captureRequested = m_captureFlag;
+        calibrationRequested = m_calibrationFlag;
+        analysisEnabled = !m_backgroundGray.empty() && m_mode != MeasurementMode::None;
     }
 
-    if (m_stopWatch.isValid() && m_stopWatch.elapsed() < 50) {
-            return;
-        }
+    // Reserve the analysis slot before copying/converting a frame. Busy frames are
+    // still eligible for UI display, but they do not allocate redundant work buffers.
+    const bool runAnalysis = analysisEnabled && !m_processingFrame.exchange(true);
+    if (!renderUi && !runAnalysis && !captureRequested && !calibrationRequested) return;
 
     cv::Mat matImage;
-
-    // Convert Pixel Buffer Formats to OpenCV Mat
     if (pFrameInfo->enPixelType == PixelType_Gvsp_Mono8) {
         matImage = cv::Mat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC1, pData).clone();
-    }
-    else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerRG8 ||
-             pFrameInfo->enPixelType == PixelType_Gvsp_BayerGB8 ||
-             pFrameInfo->enPixelType == PixelType_Gvsp_BayerBG8) {
-        cv::Mat bayerMat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC1, pData);
-        int cvBayerCode = cv::COLOR_BayerRG2BGR;
-        if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerGB8) cvBayerCode = cv::COLOR_BayerGB2BGR;
-        else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerBG8) cvBayerCode = cv::COLOR_BayerBG2BGR;
-        cv::cvtColor(bayerMat, matImage, cvBayerCode);
-    }
-    else if (pFrameInfo->enPixelType == PixelType_Gvsp_RGB8_Packed) {
+    } else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerRG8 ||
+               pFrameInfo->enPixelType == PixelType_Gvsp_BayerGR8 ||
+               pFrameInfo->enPixelType == PixelType_Gvsp_BayerGB8 ||
+               pFrameInfo->enPixelType == PixelType_Gvsp_BayerBG8) {
+        const cv::Mat bayerMat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC1, pData);
+        int conversion = cv::COLOR_BayerRG2BGR;
+        if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerGR8) conversion = cv::COLOR_BayerGR2BGR;
+        else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerGB8) conversion = cv::COLOR_BayerGB2BGR;
+        else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerBG8) conversion = cv::COLOR_BayerBG2BGR;
+        cv::cvtColor(bayerMat, matImage, conversion);
+    } else if (pFrameInfo->enPixelType == PixelType_Gvsp_RGB8_Packed) {
+        const cv::Mat rgbMat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC3, pData);
+        cv::cvtColor(rgbMat, matImage, cv::COLOR_RGB2BGR);
+    } else if (pFrameInfo->enPixelType == PixelType_Gvsp_BGR8_Packed) {
         matImage = cv::Mat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC3, pData).clone();
-        cv::cvtColor(matImage, matImage, cv::COLOR_RGB2BGR);
-    }
-    else {
-        qDebug() << "DEBUG: Unhandled pixel type received from camera callback:" << pFrameInfo->enPixelType;
+    } else {
+        if (runAnalysis) m_processingFrame.store(false);
+        qWarning() << "Unsupported camera pixel type:" << pFrameInfo->enPixelType;
         return;
     }
 
     if (matImage.empty()) {
-        qDebug() << "DEBUG: matImage conversion resulted in an empty matrix!";
+        if (runAnalysis) m_processingFrame.store(false);
         return;
     }
-
-    cv::Mat grayFrame;
-    if (matImage.channels() == 3) {
-        cv::cvtColor(matImage, grayFrame, cv::COLOR_BGR2GRAY);
-    } else {
-        grayFrame = matImage.clone();
-        cv::cvtColor(grayFrame, matImage, cv::COLOR_GRAY2BGR);
-    }
-
-    {
-        QMutexLocker locker(&m_mutex);
-        m_latestFrame = matImage.clone();
-
-        if (m_captureFlag) {
-            cv::imwrite("Blank_Bg.png", matImage);
-            m_backgroundGray = grayFrame.clone();
-            cv::medianBlur(m_backgroundGray, m_backgroundGray, 7);
-            m_captureFlag = false;
-            qDebug() << "DEBUG: Blank background captured and saved.";
-            emit statusUpdated("Background Captured!");
-        }
-
-        if (m_calibrationFlag) {
-            cv::Mat calibCopy = matImage.clone();
-            doCalibration(calibCopy);
-            m_calibrationFlag = false;
-        }
-
-
-        if (!m_backgroundGray.empty() && m_mode != MeasurementMode::None) {
-                    processFrame(matImage);
-                }
-            }
-
-            // Determine whether to stream live feed or frozen overlay snapshot
-            cv::Mat displayMat;
-            {
-                QMutexLocker locker(&m_mutex);
-                if (m_isRenderingSnapshot && !m_lastProcessedFrame.empty()) {
-                    displayMat = m_lastProcessedFrame.clone();
-                } else {
-                    displayMat = matImage.clone();
-                }
-            }
-
-            QImage qimg = matToQImage(displayMat);
-            if (!qimg.isNull()) {
-                emit frameReady(qimg);
-            }
-}
-*/
-
-void CameraWorker::handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFrameInfo) {
-    if (!pData || !pFrameInfo) return;
-
-    // 1. Top-Level Throttle to 50ms (~20 FPS) exactly like C#
-    if (m_stopWatch.isValid() && m_stopWatch.elapsed() < 50) {
-        return;
-    }
-    m_stopWatch.restart();
-
-    // 2. Convert Pixel Formats
-    cv::Mat matImage;
-    if (pFrameInfo->enPixelType == PixelType_Gvsp_Mono8) {
-        matImage = cv::Mat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC1, pData).clone();
-    }
-    else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerRG8 ||
-             pFrameInfo->enPixelType == PixelType_Gvsp_BayerGB8 ||
-             pFrameInfo->enPixelType == PixelType_Gvsp_BayerBG8) {
-        cv::Mat bayerMat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC1, pData);
-        int cvBayerCode = cv::COLOR_BayerRG2BGR;
-        if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerGB8) cvBayerCode = cv::COLOR_BayerGB2BGR;
-        else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerBG8) cvBayerCode = cv::COLOR_BayerBG2BGR;
-        cv::cvtColor(bayerMat, matImage, cvBayerCode);
-    }
-    else if (pFrameInfo->enPixelType == PixelType_Gvsp_RGB8_Packed) {
-        cv::Mat rgbMat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC3, pData);
-        cv::cvtColor(rgbMat, matImage, cv::COLOR_RGB2BGR);
-    } else {
-        return;
-    }
-
-    if (matImage.empty()) return;
 
     cv::Mat processingCopy;
-    cv::Mat displayMat;
-    bool doProcess = false;
-
-    // 3. Safely Lock, Copy, and Handle Background/Calibration (Equivalent to C# lock(frameLock))
+    cv::Mat measurementOverlay;
+    cv::Mat measurementOverlayMask;
     {
         QMutexLocker locker(&m_mutex);
         m_latestFrame = matImage.clone();
 
         if (m_captureFlag) {
-            cv::imwrite("Blank_Bg.png", m_latestFrame);
-            cv::Mat gray, blurBg;
-            if (m_latestFrame.channels() == 3) cv::cvtColor(m_latestFrame, gray, cv::COLOR_BGR2GRAY);
-            else gray = m_latestFrame.clone();
-
-            cv::medianBlur(gray, blurBg, 7);
-            m_backgroundGray = blurBg;
+            cv::Mat gray;
+            if (toGray8(matImage, gray)) {
+                cv::medianBlur(gray, m_backgroundGray, 7);
+                cv::imwrite("Blank_Bg.png", gray);
+                emit statusUpdated("Background Captured!");
+            } else {
+                emit statusUpdated("Background capture failed: unsupported image format");
+            }
+            m_measurementOverlay.release();
+            m_measurementOverlayMask.release();
             m_captureFlag = false;
-            emit statusUpdated("Background Captured!");
         }
 
         if (m_calibrationFlag) {
-            cv::Mat calibCopy = m_latestFrame.clone();
-            doCalibration(calibCopy);
+            cv::Mat calibrationFrame = matImage.clone();
+            doCalibration(calibrationFrame);
             m_calibrationFlag = false;
         }
 
-        // Prepare the async processing copy
-        if (!m_backgroundGray.empty() && m_mode != MeasurementMode::None) {
-            processingCopy = m_latestFrame.clone();
-            doProcess = true;
+        if (runAnalysis && !m_backgroundGray.empty() && m_mode != MeasurementMode::None) {
+            processingCopy = matImage.clone();
         }
-
-        // Determine what to show on the UI (Snapshot vs Live)
-        if (m_isRenderingSnapshot && !m_lastProcessedFrame.empty()) {
-            displayMat = m_lastProcessedFrame.clone();
-        } else {
-            displayMat = m_latestFrame.clone();
+        if (renderUi && sameImageGeometry(m_measurementOverlay, matImage) &&
+            sameImageGeometry(m_measurementOverlayMask, matImage)) {
+            measurementOverlay = m_measurementOverlay;
+            measurementOverlayMask = m_measurementOverlayMask;
         }
     }
 
-    // 4. HIGH-SPEED ALGORITHM PROCESSING ENGINE (Equivalent to C# Task.Run)
-    if (doProcess && !processingCopy.empty()) {
-        // Launch processing on a separate thread pool thread so the camera callback never blocks!
-        QtConcurrent::run([this, processingCopy]() {
-            cv::Mat frameToProcess = processingCopy;
-            this->processFrame(frameToProcess);
+    // Composite only the measurement graphics over the newest camera frame. This
+    // keeps contours, dimensions, and labels visible without freezing the image.
+    if (renderUi) {
+        cv::Mat displayImage = matImage;
+        if (!measurementOverlay.empty() && !measurementOverlayMask.empty() &&
+            ensureBgr8(displayImage)) {
+            measurementOverlay.copyTo(displayImage, measurementOverlayMask);
+        }
+        const QImage image = matToQImage(displayImage);
+        if (!image.isNull()) emit frameReady(image);
+    }
+
+    if (runAnalysis && !processingCopy.empty()) {
+        m_processingFuture = QtConcurrent::run([this, processingCopy]() {
+            try {
+                cv::Mat frameToProcess = processingCopy;
+                processFrame(frameToProcess);
+            } catch (const cv::Exception &error) {
+                qWarning() << "OpenCV frame-processing error:" << error.what();
+                emit statusUpdated("Image processing failed");
+            } catch (...) {
+                qWarning() << "Unexpected frame-processing error";
+                emit statusUpdated("Image processing failed");
+            }
+            m_processingFrame.store(false);
         });
-    }
-
-    // 5. UNIFIED DISPLAY RENDERING PIPELINE (Equivalent to C# BeginInvoke)
-    QImage qimg = matToQImage(displayMat);
-    if (!qimg.isNull()) {
-        emit frameReady(qimg);
+    } else if (runAnalysis) {
+        m_processingFrame.store(false);
     }
 }
+
 void CameraWorker::doCalibration(cv::Mat &src)
 {
     if (src.empty()) return;
 
     QSettings settings("MetricScope", "Settings");
-    double physicalDiameter = settings.value("calibval", 10.0).toDouble();
-    if (physicalDiameter <= 0) return;
+    const double physicalDiameter = settings.value("calibval", 10.0).toDouble();
+    if (physicalDiameter <= 0.0) return;
 
-    cv::Mat gray, blur, thresh;
-    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
-    cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
+    cv::Mat gray, blurred, binary;
+    if (!toGray8(src, gray) || !ensureBgr8(src)) return;
+    cv::GaussianBlur(gray, blurred, cv::Size(5, 5), 0);
+    cv::threshold(blurred, binary, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
 
-    cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
-
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
-    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
-    cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+    const cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+    cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, kernel);
+    cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel);
 
     std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
+    cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
     if (!contours.empty()) {
-        auto largestContour = *std::max_element(contours.begin(), contours.end(),
-            [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) {
-                return cv::contourArea(a) < cv::contourArea(b);
+        const auto &largestContour = *std::max_element(contours.begin(), contours.end(),
+            [](const std::vector<cv::Point>& first, const std::vector<cv::Point>& second) {
+                return cv::contourArea(first) < cv::contourArea(second);
             });
 
         cv::Point2f center;
-        float radius = 0;
+        float radius = 0.0f;
         cv::minEnclosingCircle(largestContour, center, radius);
-
-        if (radius > 50)
-        {
-            double calculatedPpm = (radius * 2.0) / physicalDiameter;
+        if (radius > 50.0f) {
+            const double calculatedPpm = (radius * 2.0) / physicalDiameter;
             settings.setValue("ppm", calculatedPpm);
             setPpm(calculatedPpm);
 
-            cv::circle(src, cv::Point(std::round(center.x), std::round(center.y)), std::round(radius), cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-            cv::circle(src, cv::Point(std::round(center.x), std::round(center.y)), 3, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
+            cv::circle(src, cv::Point(cvRound(center.x), cvRound(center.y)),
+                       cvRound(radius), cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+            cv::circle(src, cv::Point(cvRound(center.x), cvRound(center.y)),
+                       3, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
             cv::imwrite("calib_result.png", src);
-
             emit statusUpdated("Calibration complete");
             return;
         }
@@ -454,83 +443,32 @@ void CameraWorker::doCalibration(cv::Mat &src)
 }
 
 QImage CameraWorker::matToQImage(const cv::Mat &mat) {
-    if (mat.type() == CV_8UC3) {
+    if (mat.empty() || mat.depth() != CV_8U) return QImage();
+
+    if (mat.channels() == 3) {
         cv::Mat rgb;
         cv::cvtColor(mat, rgb, cv::COLOR_BGR2RGB);
         return QImage(rgb.data, rgb.cols, rgb.rows, static_cast<int>(rgb.step), QImage::Format_RGB888).copy();
-    } else if (mat.type() == CV_8UC1) {
-        QImage img(mat.data, mat.cols, mat.rows, static_cast<int>(mat.step), QImage::Format_Indexed8);
-        QVector<QRgb> colorTable;
-        for (int i = 0; i < 256; i++) colorTable.push_back(qRgb(i, i, i));
-        img.setColorTable(colorTable);
-        return img.copy();
+    }
+    if (mat.channels() == 4) {
+        cv::Mat rgba;
+        cv::cvtColor(mat, rgba, cv::COLOR_BGRA2RGBA);
+        return QImage(rgba.data, rgba.cols, rgba.rows, static_cast<int>(rgba.step), QImage::Format_RGBA8888).copy();
+    }
+    if (mat.channels() == 1) {
+        QImage image(mat.data, mat.cols, mat.rows, static_cast<int>(mat.step), QImage::Format_Indexed8);
+        QVector<QRgb> colorTable(256);
+        for (int value = 0; value < 256; ++value) colorTable[value] = qRgb(value, value, value);
+        image.setColorTable(colorTable);
+        return image.copy();
     }
     return QImage();
 }
 
-/*void CameraWorker::processFrame(cv::Mat &frame) {
-
-    cv::Mat liveGray, diff, thresh;
-    if (frame.channels() == 3) {
-            cv::cvtColor(frame, liveGray, cv::COLOR_BGR2GRAY);
-    } else {
-            liveGray = frame.clone();
-    }
-    //cv::cvtColor(frame, liveGray, cv::COLOR_BGR2GRAY);
-
-    cv::medianBlur(liveGray, liveGray, 7);
-
-    cv::absdiff(m_backgroundGray, liveGray, diff);
-    cv::threshold(diff, thresh, m_thresholdValue, 255, cv::THRESH_BINARY);
-
-    if (cv::countNonZero(thresh) > 1250) {
-        std::vector<std::vector<cv::Point>> contours;
-        cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
-        if (!contours.empty()) {
-            size_t largestIdx = 0;
-            double maxArea = 0;
-            for (size_t i = 0; i < contours.size(); ++i) {
-                double area = cv::contourArea(contours[i]);
-                if (area > maxArea) { maxArea = area; largestIdx = i; }
-            }
-
-            cv::Rect boundingBox = cv::boundingRect(contours[largestIdx]);
-            double aspect = static_cast<double>(boundingBox.width) / boundingBox.height;
-
-            if (aspect > 0.22 && aspect < 4.5 && maxArea > 800) {
-                cv::Moments mu = cv::moments(contours[largestIdx], true);
-                if (mu.m00 > 0) {
-                    cv::Point currentCentroid(mu.m10 / mu.m00, mu.m01 / mu.m00);
-                    double dist = std::hypot(currentCentroid.x - m_lastCentroid.x, currentCentroid.y - m_lastCentroid.y);
-
-                    if (dist > MOVEMENT_THRESHOLD) {
-                                            m_stableFrameCount = 0;
-                                            m_hasMeasuredCurrentObject = false;
-                                            emit statusUpdated("Object moving...");
-                                        } else {
-                                            if (!m_hasMeasuredCurrentObject) {
-                                                m_stableFrameCount++;
-                                                if (m_stableFrameCount >= FRAMES_TO_STABILIZE) {
-                                                    m_hasMeasuredCurrentObject = true;
-
-                                                    // Your suggestion: Clone the frame so the live feed remains untouched!
-                                                    cv::Mat isolatedFrame = frame.clone();
-                                                    triggerAutoMeasurement(isolatedFrame);
-                                                }
-                                            }
-                                        }
-                    m_lastCentroid = currentCentroid;
-                }
-            }
-        }
-    } else {
-        resetSnapshotState();
-    }
-}*/
-
 void CameraWorker::triggerAutoMeasurement(cv::Mat &frame) {
     qDebug() << "DEBUG: [triggerAutoMeasurement] Started. Mode =" << static_cast<int>(m_mode);
+    cv::Mat originalFrame = frame.clone();
+    if (!ensureBgr8(originalFrame)) return;
     QString cvDisplayString = "";
 
     switch (m_mode) {
@@ -560,8 +498,26 @@ void CameraWorker::triggerAutoMeasurement(cv::Mat &frame) {
         cvDisplayString.contains("No Shape") ||
         cvDisplayString.contains("No Valid"))
     {
-        qDebug() << "DEBUG: [triggerAutoMeasurement] Measurement failed or rejected. Aborting snapshot rendering.";
+        qDebug() << "DEBUG: [triggerAutoMeasurement] Measurement failed or rejected. Clearing live overlay.";
+        QMutexLocker locker(&m_mutex);
+        m_measurementOverlay.release();
+        m_measurementOverlayMask.release();
         return;
+    }
+
+    // Preserve only pixels drawn by the measurement function. The mask is later
+    // applied to current live frames, rather than displaying this old frame.
+    cv::Mat overlayMask;
+    if (ensureBgr8(frame) && sameImageGeometry(originalFrame, frame)) {
+        cv::Mat difference, differenceGray;
+        cv::absdiff(originalFrame, frame, difference);
+        cv::cvtColor(difference, differenceGray, cv::COLOR_BGR2GRAY);
+        cv::threshold(differenceGray, overlayMask, 1, 255, cv::THRESH_BINARY);
+    }
+    {
+        QMutexLocker locker(&m_mutex);
+        m_measurementOverlay = frame.clone();
+        m_measurementOverlayMask = overlayMask.clone();
     }
 
     qDebug() << "DEBUG: [triggerAutoMeasurement] Measurement valid. Parsing dimensions.";
@@ -593,237 +549,99 @@ void CameraWorker::triggerAutoMeasurement(cv::Mat &frame) {
     qDebug() << "DEBUG: [triggerAutoMeasurement] Extracted L:" << extractedLength << " W:" << extractedWidth;
     emit measurementResult(cvDisplayString, extractedLength, extractedWidth);
 
-    // SAVE FROZEN OVERLAY SNAPSHOT
-    {
-        QMutexLocker locker(&m_mutex);
-        if (m_lastProcessedFrame.empty()) {
-            m_lastProcessedFrame = cv::Mat();
-        }
-        frame.clone().copyTo(m_lastProcessedFrame);
-        m_isRenderingSnapshot = true;
-        qDebug() << "DEBUG: [triggerAutoMeasurement] Saved frozen snapshot and activated m_isRenderingSnapshot = true.";
-    }
-
     // ... (Keep the rest of your SQLite / GPIO logic down here exactly as it is) ...
     qDebug() << "DEBUG: [triggerAutoMeasurement] Finished processing database/GPIO.";
 }
 
 
 void CameraWorker::processFrame(cv::Mat &frame) {
-    cv::Mat liveGray, diff, thresh;
+    if (frame.empty()) return;
 
-    if (frame.channels() == 3) {
-        cv::cvtColor(frame, liveGray, cv::COLOR_BGR2GRAY);
-    } else {
-        liveGray = frame.clone();
-    }
-
-    //cv::medianBlur(liveGray, liveGray, 7);
-
-    cv::Mat bgCopy;
+    cv::Mat background;
     {
         QMutexLocker locker(&m_mutex);
-        bgCopy = m_backgroundGray.clone();
+        background = m_backgroundGray;
     }
+    if (background.empty() || !sameImageGeometry(background, frame)) return;
 
-    if (bgCopy.empty()) return;
+    // Object stability does not need full camera resolution. Track on a bounded
+    // working image, then run the selected measurement once on the original frame.
+    // This preserves all measurement geometry while substantially reducing the
+    // per-frame blur, subtraction, threshold, and contour workload.
+    const int longestSide = std::max(frame.cols, frame.rows);
+    const double trackingScale = longestSide > 960 ? 960.0 / longestSide : 1.0;
+    cv::Mat fullGray;
+    if (!toGray8(frame, fullGray)) return;
 
-    cv::absdiff(bgCopy, liveGray, diff);
-    cv::threshold(diff, thresh, m_thresholdValue, 255, cv::THRESH_BINARY);
-
-    if (cv::countNonZero(thresh) > 1250) {
-        std::vector<std::vector<cv::Point>> contours;
-        cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
-        if (!contours.empty()) {
-            int bestIdx = -1;
-            double maxArea = 0;
-
-            for (size_t i = 0; i < contours.size(); ++i) {
-                double area = cv::contourArea(contours[i]);
-                cv::Rect rect = cv::boundingRect(contours[i]);
-
-                // Ignore Hikrobot edge artifacts
-                bool touchesBorder = (rect.x <= 2 || rect.y <= 2 ||
-                                      rect.x + rect.width >= frame.cols - 2 ||
-                                      rect.y + rect.height >= frame.rows - 2);
-
-                if (!touchesBorder && area > maxArea) {
-                    maxArea = area;
-                    bestIdx = static_cast<int>(i);
-                }
-            }
-
-            if (bestIdx != -1) {
-                cv::Rect boundingBox = cv::boundingRect(contours[bestIdx]);
-                double aspect = static_cast<double>(boundingBox.width) / boundingBox.height;
-
-                if (aspect > 0.22 && aspect < 4.5 && maxArea > 800) {
-                    cv::Moments mu = cv::moments(contours[bestIdx], true);
-                    if (mu.m00 > 0) {
-                        cv::Point currentCentroid(mu.m10 / mu.m00, mu.m01 / mu.m00);
-
-                        QMutexLocker locker(&m_mutex); // Lock tracking variables
-                        double dist = std::hypot(currentCentroid.x - m_lastCentroid.x, currentCentroid.y - m_lastCentroid.y);
-
-                        if (dist > MOVEMENT_THRESHOLD) {
-                            m_stableFrameCount = 0;
-                            m_hasMeasuredCurrentObject = false;
-                            m_isRenderingSnapshot = false; // Reset snapshot instantly
-                            emit statusUpdated("Object moving...");
-                        } else {
-                            if (!m_hasMeasuredCurrentObject) {
-                                m_stableFrameCount++;
-                                if (m_stableFrameCount >= FRAMES_TO_STABILIZE) {
-                                    m_hasMeasuredCurrentObject = true;
-
-                                    cv::Mat isolatedFrame = frame.clone();
-
-                                    // Unlock before jumping into the heavy drawing function
-                                    locker.unlock();
-                                    triggerAutoMeasurement(isolatedFrame);
-                                    locker.relock();
-                                }
-                            }
-                        }
-                        m_lastCentroid = currentCentroid;
-                    }
-                }
-            }
-        }
+    cv::Mat liveGray;
+    cv::Mat trackingBackground;
+    if (trackingScale < 1.0) {
+        cv::resize(fullGray, liveGray, cv::Size(), trackingScale, trackingScale, cv::INTER_LINEAR);
+        cv::resize(background, trackingBackground, liveGray.size(), 0.0, 0.0, cv::INTER_LINEAR);
     } else {
+        liveGray = fullGray;
+        trackingBackground = background;
+    }
+    int blurSize = std::max(3, cvRound(7.0 * trackingScale));
+    if (blurSize % 2 == 0) ++blurSize;
+    cv::medianBlur(liveGray, liveGray, blurSize);
+
+    cv::Mat difference;
+    cv::Mat binary;
+    cv::absdiff(trackingBackground, liveGray, difference);
+    cv::threshold(difference, binary, m_thresholdValue, 255, cv::THRESH_BINARY);
+
+    const double areaScale = trackingScale * trackingScale;
+    const int minimumForeground = std::max(50, cvRound(1250.0 * areaScale));
+    if (cv::countNonZero(binary) <= minimumForeground) {
         resetSnapshotState();
-    }
-}
-/*void CameraWorker::triggerAutoMeasurement(cv::Mat &frame) {
-    QString cvDisplayString = "";
-
-    switch (m_mode) {
-        case MeasurementMode::Round:    cvDisplayString = measureRound(frame); break;
-        case MeasurementMode::Pear:     cvDisplayString = measurePear(frame); break;
-        case MeasurementMode::Oval:     cvDisplayString = measureOval(frame); break;
-        case MeasurementMode::Heart:    cvDisplayString = measureHeart(frame); break;
-        case MeasurementMode::Marquise: cvDisplayString = measureMarquise(frame); break;
-        case MeasurementMode::Poly:     cvDisplayString = measurePolygon(frame); break;
-        case MeasurementMode::General:  cvDisplayString = measureGeneral(frame); break;
-        case MeasurementMode::GeneralC: cvDisplayString = measureGeneralC(frame); break;
-        case MeasurementMode::Custom:   cvDisplayString = measureCustom(frame); break;
-        default: return;
-    }
-
-    if (!cvDisplayString.isEmpty()) emit statusUpdated(cvDisplayString);
-
-    if (cvDisplayString.isEmpty() || cvDisplayString.contains("Error") ||
-        cvDisplayString.contains("Please Calibrate") || cvDisplayString.toLower().contains("object")) {
         return;
     }
 
-    double extractedLength = 0.0, extractedWidth = 0.0;
-
-    if (m_mode == MeasurementMode::Round) {
-        QStringList parts = cvDisplayString.split(" ", QString::SkipEmptyParts);
-        if (parts.size() >= 3) extractedLength = parts[2].toDouble();
-    }
-    else if (cvDisplayString.contains("Side")) {
-        QRegularExpression regex("Side\\s+\\d+:\\s+([0-9]+(?:\\.[0-9]+)?)");
-        QRegularExpressionMatchIterator i = regex.globalMatch(cvDisplayString);
-        double maxSide = 0.0, minSide = 999999.0;
-        while (i.hasNext()) {
-            double val = i.next().captured(1).toDouble();
-            if (val > maxSide) maxSide = val;
-            if (val < minSide) minSide = val;
-        }
-        extractedLength = maxSide;
-        extractedWidth = (minSide == 999999.0) ? 0.0 : minSide;
-    }
-    else {
-        QRegularExpression regex("[0-9]+(?:\\.[0-9]+)?");
-        QRegularExpressionMatchIterator i = regex.globalMatch(cvDisplayString);
-        if (i.hasNext()) extractedLength = i.next().captured(0).toDouble();
-        if (i.hasNext()) extractedWidth = i.next().captured(0).toDouble();
-    }
-    emit measurementResult(cvDisplayString,extractedLength,extractedWidth);
-    //
-
-        // ==========================================================
-        // SAVE FROZEN OVERLAY SNAPSHOT
-        // ==========================================================
-        if (m_lastProcessedFrame.empty()) {
-            m_lastProcessedFrame = cv::Mat();
-        }
-        frame.clone().copyTo(m_lastProcessedFrame);
-        m_isRenderingSnapshot = true;
-
-    //
-    // ==========================================================
-    // SQLITE DATABASE RULE MATCHING & RASPBERRY PI GPIO PULSE
-    // ==========================================================
-    int targetSquareNumber = -1;
-    QSettings settings("MetricScope", "Settings");
-    QString currentFile = settings.value("cmbFile", "Default_Profile").toString();
-
-    QSqlDatabase db = QSqlDatabase::contains("qt_sql_default_connection")
-                        ? QSqlDatabase::database("qt_sql_default_connection")
-                        : QSqlDatabase::addDatabase("QSQLITE");
-
-    if (!db.isOpen()) {
-        db.setDatabaseName("History.db");
-        if (!db.open()) return;
-    }
-
-    if (db.isOpen()) {
-        QSqlQuery query;
-        query.prepare("SELECT Number, FromLength, ToLength, FromWidth, ToWidth FROM TrayRules WHERE FileName = :file ORDER BY Number ASC;");
-        query.bindValue(":file", currentFile);
-
-        if (query.exec()) {
-            while (query.next()) {
-                int number = query.value("Number").toInt();
-                double fromLen = query.value("FromLength").toDouble();
-                double toLen = query.value("ToLength").toDouble();
-                double fromWid = query.value("FromWidth").toDouble();
-                double toWid = query.value("ToWidth").toDouble();
-
-                if (m_mode == MeasurementMode::Round) {
-                    if (extractedLength >= fromLen && extractedLength <= toLen) {
-                        targetSquareNumber = number;
-                        break;
-                    }
-                } else {
-                    if (extractedLength >= fromLen && extractedLength <= toLen &&
-                        extractedWidth >= fromWid && extractedWidth <= toWid) {
-                        targetSquareNumber = number;
-                        break;
-                    }
-                }
-            }
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    int bestIndex = -1;
+    double largestArea = 0.0;
+    for (size_t index = 0; index < contours.size(); ++index) {
+        const double area = cv::contourArea(contours[index]);
+        const cv::Rect bounds = cv::boundingRect(contours[index]);
+        const bool touchesBorder = bounds.x <= 2 || bounds.y <= 2 ||
+            bounds.br().x >= binary.cols - 2 || bounds.br().y >= binary.rows - 2;
+        if (!touchesBorder && area > largestArea) {
+            largestArea = area;
+            bestIndex = static_cast<int>(index);
         }
     }
+    if (bestIndex < 0 || largestArea / areaScale <= 800.0) return;
 
-    if (targetSquareNumber != -1) {
-        QString storageFilePath = "tray_counters.json";
-        QJsonObject countersObj;
+    const cv::Rect bounds = cv::boundingRect(contours[bestIndex]);
+    if (bounds.height <= 0) return;
+    const double aspect = static_cast<double>(bounds.width) / bounds.height;
+    if (aspect <= 0.22 || aspect >= 4.5) return;
 
-        QFile loadFile(storageFilePath);
-        if (loadFile.open(QIODevice::ReadOnly)) {
-            countersObj = QJsonDocument::fromJson(loadFile.readAll()).object();
-            loadFile.close();
-        }
+    const cv::Moments moments = cv::moments(contours[bestIndex], true);
+    if (moments.m00 <= 0.0) return;
+    const cv::Point currentCentroid(
+        cvRound((moments.m10 / moments.m00) / trackingScale),
+        cvRound((moments.m01 / moments.m00) / trackingScale));
 
-        QString key = QString::number(targetSquareNumber);
-        countersObj[key] = countersObj.value(key).toInt(0) + 1;
-
-        QFile saveFile(storageFilePath);
-        if (saveFile.open(QIODevice::WriteOnly)) {
-            saveFile.write(QJsonDocument(countersObj).toJson());
-            saveFile.close();
-        }
-
-        triggerPiGpioOutput(targetSquareNumber);
+    QMutexLocker locker(&m_mutex);
+    const double movement = cv::norm(currentCentroid - m_lastCentroid);
+    if (movement > MOVEMENT_THRESHOLD) {
+        m_stableFrameCount = 0;
+        m_hasMeasuredCurrentObject = false;
+        m_measurementOverlay.release();
+        m_measurementOverlayMask.release();
+        emit statusUpdated("Object moving...");
+    } else if (!m_hasMeasuredCurrentObject && ++m_stableFrameCount >= FRAMES_TO_STABILIZE) {
+        m_hasMeasuredCurrentObject = true;
+        cv::Mat measurementFrame = frame.clone();
+        locker.unlock();
+        triggerAutoMeasurement(measurementFrame);
+        locker.relock();
     }
+    m_lastCentroid = currentCentroid;
 }
-*/
-
 // ============================================================================
 // HELPER METHODS
 // ============================================================================
@@ -835,8 +653,8 @@ void CameraWorker::requestCalibration() {
 
 double CameraWorker::getPpm() {
     QSettings settings("MetricScope", "Settings");
-    double p = settings.value("ppm", 1.0).toDouble();
-    return (p <= 0) ? 1.0 : p;
+    const double ppm = settings.value("ppm", 1.0).toDouble();
+    return ppm > 0.0 ? ppm : 1.0;
 }
 
 double CameraWorker::applyVariation(double rawMeasurementMM, bool isLength) {
@@ -845,10 +663,9 @@ double CameraWorker::applyVariation(double rawMeasurementMM, bool isLength) {
     if (rangeIndex < 0) rangeIndex = 0;
 
     QSettings settings("MetricScope", "Settings");
-    QString regKey = isLength ? QString("LenVar_%1").arg(rangeIndex) : QString("WidVar_%1").arg(rangeIndex);
-
-    double variation = settings.value(regKey, 0.0).toDouble();
-    return rawMeasurementMM + variation;
+    const QString regKey = isLength ? QString("LenVar_%1").arg(rangeIndex)
+                                    : QString("WidVar_%1").arg(rangeIndex);
+    return rawMeasurementMM + settings.value(regKey, 0.0).toDouble();
 }
 
 void CameraWorker::triggerPiGpioOutput(int boxNumber) {
@@ -894,24 +711,22 @@ void CameraWorker::triggerPiGpioOutput(int boxNumber) {
 QString CameraWorker::measureGeneral(cv::Mat &src) {
     if (src.empty()) return "No Image Data";
     double ppm = getPpm();
-    if (src.channels() == 1) {
-            cv::cvtColor(src, src, cv::COLOR_GRAY2BGR);
-    }
+    if (!ensureBgr8(src)) return "Error: Unsupported image format";
     cv::Mat gray, blur, thresh;
     cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
     cv::GaussianBlur(gray, blur, cv::Size(3, 3), 0);
     cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
 
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
-    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
     cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
 
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
     if (contours.empty()) return "No Shape Found";
 
-    auto largestContour = *std::max_element(contours.begin(), contours.end(),
+    const auto &largestContour = *std::max_element(contours.begin(), contours.end(),
         [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
 
     if (cv::contourArea(largestContour) < 800) return "No Object Detected (Noise Ignored)";
@@ -956,30 +771,30 @@ QString CameraWorker::measureGeneral(cv::Mat &src) {
     //cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
     //cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
 
-    cv::imwrite("Box_Shape_Result.png", src);
     return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(boxLengthMM, 0, 'f', 2).arg(boxWidthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
 }
 
 QString CameraWorker::measureMarquise(cv::Mat &src) {
     if (src.empty()) return "No Image Data";
     double ppm = getPpm();
-    if (src.channels() == 1) {
-            cv::cvtColor(src, src, cv::COLOR_GRAY2BGR);
-    }
+    if (!ensureBgr8(src)) return "Error: Unsupported image format";
     cv::Mat gray, blur, thresh;
     cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
     cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
     cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
 
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
     cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
 
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
     if (contours.empty()) return "No Shape Found";
 
-    auto largestContour = *std::max_element(contours.begin(), contours.end(),
+    const auto &largestContour = *std::max_element(contours.begin(), contours.end(),
         [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
+
+    if (cv::contourArea(largestContour) < 800.0) return "No Object Detected (Noise Ignored)";
 
     std::vector<cv::Point> hull;
     cv::convexHull(largestContour, hull);
@@ -1040,28 +855,32 @@ QString CameraWorker::measureMarquise(cv::Mat &src) {
     //cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
     //cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
 
-    cv::imwrite("Marquise_Result.png", src);
     return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
 }
 
 QString CameraWorker::measureHeart(cv::Mat &src) {
     if (src.empty()) return "No Shape Found";
     double ppm = getPpm();
-    if (src.channels() == 1) {
-            cv::cvtColor(src, src, cv::COLOR_GRAY2BGR);
-    }
+    if (!ensureBgr8(src)) return "Error: Unsupported image format";
     cv::Mat gray, blur, thresh;
     cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
     cv::GaussianBlur(gray, blur, cv::Size(3, 3), 0);
     cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
 
+    // Opening removes isolated dust and narrow dust-to-object bridges; closing
+    // restores small gaps in the actual silhouette before contour extraction.
+    const cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
+
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
     if (contours.empty()) return "No Shape Found";
 
-    auto largestContour = *std::max_element(contours.begin(), contours.end(),
+    const auto &largestContour = *std::max_element(contours.begin(), contours.end(),
         [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
 
+    if (cv::contourArea(largestContour) < 800.0) return "No Object Detected (Noise Ignored)";
     if (largestContour.size() < 5) return "Shape too simple";
 
     std::vector<int> hullIndices;
@@ -1135,95 +954,73 @@ QString CameraWorker::measureHeart(cv::Mat &src) {
     //cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
     //cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
 
-    cv::imwrite("Heart_Result.png", src);
     return QString("Length : %1 mm\nWidth  : %2 mm\nDip    : %3 mm\nL/W Ratio : %4").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(dipDepthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
 }
 
 QString CameraWorker::measurePear(cv::Mat &src) {
     if (src.empty()) return "No Shape Found";
-    double ppm = getPpm();
-    if (src.channels() == 1) {
-            cv::cvtColor(src, src, cv::COLOR_GRAY2BGR);
-    }
-    cv::Mat gray, blur, thresh;
-    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
-    cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
-    cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+    const double ppm = getPpm();
+    if (!ensureBgr8(src)) return "Error: Unsupported image format";
 
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
-    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
+    cv::Mat gray, blurred, binary;
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray, blurred, cv::Size(5, 5), 0);
+    cv::threshold(blurred, binary, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+    const cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, kernel);
 
     std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+    cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
     if (contours.empty()) return "No Shape Found";
 
-    auto largestContour = *std::max_element(contours.begin(), contours.end(),
-        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
+    const auto &contour = *std::max_element(contours.begin(), contours.end(),
+        [](const std::vector<cv::Point>& first, const std::vector<cv::Point>& second) {
+            return cv::contourArea(first) < cv::contourArea(second);
+        });
+    if (cv::contourArea(contour) < 800.0) return "No Object Detected (Noise Ignored)";
 
     std::vector<cv::Point> hull;
-    cv::convexHull(largestContour, hull);
+    cv::convexHull(contour, hull);
+    const cv::RotatedRect box = cv::minAreaRect(hull);
+    if (box.size.width <= 0.0f || box.size.height <= 0.0f) return "No Valid Object Found";
 
-    cv::Moments mu = cv::moments(hull);
-    cv::Point centroid(mu.m10 / mu.m00, mu.m01 / mu.m00);
+    cv::Point2f corners[4];
+    box.points(corners);
+    const cv::Point2f side01 = (corners[0] + corners[1]) * 0.5f;
+    const cv::Point2f side12 = (corners[1] + corners[2]) * 0.5f;
+    const cv::Point2f side23 = (corners[2] + corners[3]) * 0.5f;
+    const cv::Point2f side30 = (corners[3] + corners[0]) * 0.5f;
 
-    cv::Point pearTip = hull[0];
-    double maxDistToCentroid = 0;
-    for (const auto& p : hull) {
-        double dist = std::hypot(p.x - centroid.x, p.y - centroid.y);
-        if (dist > maxDistToCentroid) { maxDistToCentroid = dist; pearTip = p; }
+    cv::Point2f lengthStart, lengthEnd, widthStart, widthEnd;
+    if (cv::norm(side01 - side23) >= cv::norm(side12 - side30)) {
+        lengthStart = side01; lengthEnd = side23;
+        widthStart = side12; widthEnd = side30;
+    } else {
+        lengthStart = side12; lengthEnd = side30;
+        widthStart = side01; widthEnd = side23;
     }
 
-    double dirX = centroid.x - pearTip.x;
-    double dirY = centroid.y - pearTip.y;
-    double lenVector = std::hypot(dirX, dirY);
-    dirX /= (lenVector == 0 ? 1 : lenVector);
-    dirY /= (lenVector == 0 ? 1 : lenVector);
+    const double lengthPx = cv::norm(lengthEnd - lengthStart);
+    const double widthPx = cv::norm(widthEnd - widthStart);
+    const double lengthMM = applyVariation(lengthPx / ppm, true);
+    const double widthMM = applyVariation(widthPx / ppm, false);
+    const double ratio = widthMM > 0.0 ? lengthMM / widthMM : 0.0;
 
-    cv::Point pearBase = centroid;
-    double maxBaseProjection = 0;
-    for (const auto& p : hull) {
-        double projection = (p.x - pearTip.x) * dirX + (p.y - pearTip.y) * dirY;
-        if (projection > maxBaseProjection) {
-            maxBaseProjection = projection;
-            pearBase = cv::Point(pearTip.x + (int)(dirX * projection), pearTip.y + (int)(dirY * projection));
-        }
-    }
-
-    double maxWidthDist = 0;
-    cv::Point widthL(0, 0), widthR(0, 0);
-    for (size_t i = 0; i < hull.size(); i++) {
-        for (size_t j = i + 1; j < hull.size(); j++) {
-            double sX = hull[j].x - hull[i].x;
-            double sY = hull[j].y - hull[i].y;
-            double perpDistance = std::abs(sX * dirY - sY * dirX);
-            if (perpDistance > maxWidthDist) { maxWidthDist = perpDistance; widthL = hull[i]; widthR = hull[j]; }
-        }
-    }
-
-    double lengthMM = applyVariation(maxBaseProjection / ppm, true);
-    double widthMM = applyVariation(maxWidthDist / ppm, false);
-    double ratio = (widthMM == 0) ? 0 : lengthMM / widthMM;
-
-    cv::line(src, pearTip, pearBase, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
-    cv::line(src, widthL, widthR, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
-    cv::circle(src, centroid, 5, cv::Scalar(0, 165, 255), -1, cv::LINE_AA);
     std::vector<std::vector<cv::Point>> hullWrapper = { hull };
     cv::polylines(src, hullWrapper, true, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+    cv::line(src, lengthStart, lengthEnd, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
+    cv::line(src, widthStart, widthEnd, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+    cv::circle(src, box.center, 4, cv::Scalar(0, 165, 255), -1, cv::LINE_AA);
+    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(),
+                cv::Point(cvRound(box.center.x + 20), cvRound(box.center.y - 20)),
+                cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+    cv::putText(src, QString("W: %1mm").arg(widthMM, 0, 'f', 2).toStdString(),
+                cv::Point(cvRound(widthStart.x + 10), cvRound(widthStart.y + 20)),
+                cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
 
-    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), cv::Point(centroid.x + 25, centroid.y - 20), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
-    cv::putText(src, QString("W: %1mm").arg(widthMM, 0, 'f', 2).toStdString(), cv::Point(widthL.x + 15, widthL.y + 25), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
-
-    //cv::Mat printCanvas(src.size(), CV_8UC3, cv::Scalar(255, 255, 255));
-    //cv::polylines(printCanvas, hullWrapper, true, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
-    //cv::Rect cropRect = cv::boundingRect(hull);
-    //cropRect.x = std::max(0, cropRect.x - 15);
-    //cropRect.y = std::max(0, cropRect.y - 15);
-    //cropRect.width = std::min(printCanvas.cols - cropRect.x, cropRect.width + 30);
-    //cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
-    //cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
-
-    cv::imwrite("Pear_Result.png", src);
-    return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
+    return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3")
+        .arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
 }
 
 QString CameraWorker::measureOval(cv::Mat &src) {
@@ -1234,17 +1031,19 @@ QString CameraWorker::measureOval(cv::Mat &src) {
     }
 
     double ppm = getPpm();
-    if (src.channels() == 1) {
-        cv::cvtColor(src, src, cv::COLOR_GRAY2BGR);
-        qDebug() << "DEBUG: [measureOval] Converted 1-channel src to BGR.";
-    }
+    if (!ensureBgr8(src)) return "Error: Unsupported image format";
 
     cv::Mat gray, blur, diff, thresh;
     cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
     cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
 
-    if (!m_backgroundGray.empty()) {
-        cv::absdiff(m_backgroundGray, blur, diff);
+    cv::Mat background;
+    {
+        QMutexLocker locker(&m_mutex);
+        background = m_backgroundGray.clone();
+    }
+    if (!background.empty() && sameImageGeometry(background, blur)) {
+        cv::absdiff(background, blur, diff);
         cv::threshold(diff, thresh, m_thresholdValue, 255, cv::THRESH_BINARY);
         qDebug() << "DEBUG: [measureOval] Applied background subtraction threshold.";
     } else {
@@ -1253,8 +1052,8 @@ QString CameraWorker::measureOval(cv::Mat &src) {
     }
 
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
-    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
     cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
 
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
@@ -1291,127 +1090,42 @@ QString CameraWorker::measureOval(cv::Mat &src) {
         return "No Valid Object Found";
     }
 
-    std::vector<cv::Point> hull;
-    cv::convexHull(bestContour, hull);
+    if (bestContour.size() < 5) return "No Valid Object Found";
 
-    cv::Point lenStart(0, 0), lenEnd(0, 0);
-    double maxLenDist = 0;
-    for (size_t i = 0; i < hull.size(); i++) {
-        for (size_t j = i + 1; j < hull.size(); j++) {
-            double d = std::hypot(hull[i].x - hull[j].x, hull[i].y - hull[j].y);
-            if (d > maxLenDist) {
-                maxLenDist = d;
-                lenStart = hull[i];
-                lenEnd = hull[j];
-            }
-        }
-    }
+    const cv::RotatedRect ellipse = cv::fitEllipse(bestContour);
+    const double lengthPx = std::max(ellipse.size.width, ellipse.size.height);
+    const double widthPx = std::min(ellipse.size.width, ellipse.size.height);
+    if (lengthPx <= 0.0 || widthPx <= 0.0) return "No Valid Object Found";
 
-    double maxWidthDist = 0;
-    cv::Point widStart(0, 0), widEnd(0, 0);
-    double axisX = lenEnd.x - lenStart.x;
-    double axisY = lenEnd.y - lenStart.y;
-    double axisLength = std::hypot(axisX, axisY);
+    // fitEllipse.angle follows the ellipse width axis. Rotate by 90 degrees when
+    // height is the major diameter so the displayed axes match the measurements.
+    double majorAngleDegrees = ellipse.angle;
+    if (ellipse.size.height >= ellipse.size.width) majorAngleDegrees += 90.0;
+    const double majorAngle = majorAngleDegrees * CV_PI / 180.0;
+    const cv::Point2f majorDirection(std::cos(majorAngle), std::sin(majorAngle));
+    const cv::Point2f minorDirection(-majorDirection.y, majorDirection.x);
+    const cv::Point2f lenStart = ellipse.center - majorDirection * static_cast<float>(lengthPx * 0.5);
+    const cv::Point2f lenEnd = ellipse.center + majorDirection * static_cast<float>(lengthPx * 0.5);
+    const cv::Point2f widStart = ellipse.center - minorDirection * static_cast<float>(widthPx * 0.5);
+    const cv::Point2f widEnd = ellipse.center + minorDirection * static_cast<float>(widthPx * 0.5);
 
-    for (size_t i = 0; i < hull.size(); i++) {
-        for (size_t j = i + 1; j < hull.size(); j++) {
-            double sX = hull[j].x - hull[i].x;
-            double sY = hull[j].y - hull[i].y;
-            double crossProduct = std::abs(sX * axisY - sY * axisX) / (axisLength == 0 ? 1 : axisLength);
-
-            if (crossProduct > maxWidthDist) {
-                maxWidthDist = crossProduct;
-                widStart = hull[i];
-                widEnd = hull[j];
-            }
-        }
-    }
-
-    double lengthMM = applyVariation(maxLenDist / ppm, true);
-    double widthMM = applyVariation(maxWidthDist / ppm, false);
-    double ratio = (widthMM == 0) ? 0 : lengthMM / widthMM;
-    cv::Point center((lenStart.x + lenEnd.x) / 2, (lenStart.y + lenEnd.y) / 2);
+    const double lengthMM = applyVariation(lengthPx / ppm, true);
+    const double widthMM = applyVariation(widthPx / ppm, false);
+    const double ratio = widthMM > 0.0 ? lengthMM / widthMM : 0.0;
 
     qDebug() << "DEBUG: [measureOval] Drawing lines... L:" << lengthMM << "W:" << widthMM;
 
     cv::line(src, lenStart, lenEnd, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
     cv::line(src, widStart, widEnd, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
-    cv::circle(src, center, 5, cv::Scalar(0, 165, 255), -1, cv::LINE_AA);
+    cv::ellipse(src, ellipse, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+    cv::circle(src, ellipse.center, 5, cv::Scalar(0, 165, 255), -1, cv::LINE_AA);
 
-    std::vector<std::vector<cv::Point>> hullWrapper = { hull };
-    cv::polylines(src, hullWrapper, true, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-
-    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), cv::Point(center.x + 25, center.y - 20), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), cv::Point(cvRound(ellipse.center.x + 25), cvRound(ellipse.center.y - 20)), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
     cv::putText(src, QString("W: %1mm").arg(widthMM, 0, 'f', 2).toStdString(), cv::Point(widStart.x + 15, widStart.y + 25), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
 
-    cv::imwrite("ovel_Result.png", src);
-    qDebug() << "DEBUG: [measureOval] Finished writing ovel_Result.png and returning string.";
 
     return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
 }
-
-/*QString CameraWorker::measureOval(cv::Mat &src) {
-    if (src.empty()) return "No Shape Found";
-    double ppm = getPpm();
-
-    cv::Mat gray, blur, thresh;
-    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
-    cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
-    cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
-
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
-    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
-
-    std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
-    if (contours.empty()) return "No Shape Found";
-
-    auto largestContour = *std::max_element(contours.begin(), contours.end(),
-        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
-
-    std::vector<cv::Point> hull;
-    cv::convexHull(largestContour, hull);
-
-    cv::RotatedRect minRect = cv::minAreaRect(hull);
-    double lengthMM = applyVariation(std::max(minRect.size.width, minRect.size.height) / ppm, true);
-    double widthMM = applyVariation(std::min(minRect.size.width, minRect.size.height) / ppm, false);
-    double ratio = (widthMM == 0) ? 0 : lengthMM / widthMM;
-
-    cv::Point2f rectPoints[4];
-    minRect.points(rectPoints);
-    cv::Point pt01((rectPoints[0].x + rectPoints[1].x) / 2, (rectPoints[0].y + rectPoints[1].y) / 2);
-    cv::Point pt12((rectPoints[1].x + rectPoints[2].x) / 2, (rectPoints[1].y + rectPoints[2].y) / 2);
-    cv::Point pt23((rectPoints[2].x + rectPoints[3].x) / 2, (rectPoints[2].y + rectPoints[3].y) / 2);
-    cv::Point pt30((rectPoints[3].x + rectPoints[0].x) / 2, (rectPoints[3].y + rectPoints[0].y) / 2);
-
-    cv::Point lenStart, lenEnd, widStart, widEnd;
-    if (std::hypot(pt01.x - pt23.x, pt01.y - pt23.y) > std::hypot(pt12.x - pt30.x, pt12.y - pt30.y)) {
-        lenStart = pt01; lenEnd = pt23; widStart = pt12; widEnd = pt30;
-    } else {
-        lenStart = pt12; lenEnd = pt30; widStart = pt01; widEnd = pt23;
-    }
-
-    cv::line(src, lenStart, lenEnd, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
-    cv::line(src, widStart, widEnd, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
-    cv::circle(src, minRect.center, 5, cv::Scalar(0, 165, 255), -1, cv::LINE_AA);
-    std::vector<std::vector<cv::Point>> hullWrapper = { hull };
-    cv::polylines(src, hullWrapper, true, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-
-    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), cv::Point(minRect.center.x + 25, minRect.center.y - 20), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
-    cv::putText(src, QString("W: %1mm").arg(widthMM, 0, 'f', 2).toStdString(), cv::Point(widStart.x + 15, widStart.y + 25), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
-
-    cv::Mat printCanvas(src.size(), CV_8UC3, cv::Scalar(255, 255, 255));
-    cv::polylines(printCanvas, hullWrapper, true, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
-    cv::Rect cropRect = cv::boundingRect(hull);
-    cropRect.x = std::max(0, cropRect.x - 15); cropRect.y = std::max(0, cropRect.y - 15);
-    cropRect.width = std::min(printCanvas.cols - cropRect.x, cropRect.width + 30);
-    cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
-    cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
-
-    cv::imwrite("ovel_Result.png", src);
-    return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
-}
-*/
 
 // ============================================================================
 // POLYGON & CUSTOM SHAPE MATH HELPERS
@@ -1451,9 +1165,21 @@ void CameraWorker::sortCornersClockwise(std::vector<cv::Point>& points) {
 }
 
 void CameraWorker::getInvariantTransform(const std::vector<cv::Point>& hull, cv::Point2f& centroid, double& angle, float& scale) {
+    if (hull.empty()) {
+        centroid = cv::Point2f();
+        angle = 0.0;
+        scale = 1.0f;
+        return;
+    }
     cv::Moments mu = cv::moments(hull);
+    if (std::abs(mu.m00) <= std::numeric_limits<double>::epsilon()) {
+        centroid = cv::Point2f(hull.front());
+        angle = 0.0;
+        scale = 1.0f;
+        return;
+    }
     centroid = cv::Point2f(mu.m10 / mu.m00, mu.m01 / mu.m00);
-    scale = std::sqrt(mu.m00);
+    scale = std::max(1.0f, static_cast<float>(std::sqrt(std::abs(mu.m00))));
 
     double theta = 0.0;
     if (std::abs(mu.mu20 - mu.mu02) < 1e-2 && std::abs(mu.mu11) < 1e-2) {
@@ -1505,23 +1231,21 @@ void CameraWorker::getInvariantTransform(const std::vector<cv::Point>& hull, cv:
 QString CameraWorker::measurePolygon(cv::Mat &src) {
     if (src.empty()) return "No Image Data";
     double ppm = getPpm();
-    if (src.channels() == 1) {
-            cv::cvtColor(src, src, cv::COLOR_GRAY2BGR);
-    }
+    if (!ensureBgr8(src)) return "Error: Unsupported image format";
     cv::Mat gray, blur, thresh;
     cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
     cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
     cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
 
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
-    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
     cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
 
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
     if (contours.empty()) return "No Polygon Found";
-    auto largestContour = *std::max_element(contours.begin(), contours.end(),
+    const auto &largestContour = *std::max_element(contours.begin(), contours.end(),
         [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
 
     if (cv::contourArea(largestContour) < 800) return "No Object Detected (Noise Ignored)";
@@ -1607,7 +1331,6 @@ QString CameraWorker::measurePolygon(cv::Mat &src) {
         cv::putText(src, QString("%1°").arg(angle, 0, 'f', 1).toStdString(), cv::Point(current.x + 10, current.y), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
     }
 
-    cv::imwrite("Polygon_Result.png", src);
     return QString("Length: %1 mm\nWidth : %2 mm\n").arg(generalLengthMM, 0, 'f', 2).arg(generalWidthMM, 0, 'f', 2) + angleString;
 }
 
@@ -1617,10 +1340,8 @@ QString CameraWorker::measurePolygon(cv::Mat &src) {
 QString CameraWorker::measureCustom(cv::Mat &src) {
     if (m_activeCustomShape.Name.isEmpty()) return "Error: No Active Shape Selected";
     double ppm = getPpm();
-    if (src.channels() == 1) {
-            cv::cvtColor(src, src, cv::COLOR_GRAY2BGR);
-    }
-    cv::Mat gray, blur, thresh, edges;
+    if (!ensureBgr8(src)) return "Error: Unsupported image format";
+    cv::Mat gray, edges;
     cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
     cv::medianBlur(gray, gray, 5);
     cv::Canny(gray, edges, 40, 120);
@@ -1632,7 +1353,7 @@ QString CameraWorker::measureCustom(cv::Mat &src) {
     cv::findContours(edges, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
     if (contours.empty()) return "Object not present";
-    auto largestContour = *std::max_element(contours.begin(), contours.end(),
+    const auto &largestContour = *std::max_element(contours.begin(), contours.end(),
         [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
 
     if (cv::contourArea(largestContour) < 1200) return "Object not present";
@@ -1674,7 +1395,6 @@ QString CameraWorker::measureCustom(cv::Mat &src) {
     //cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
     //cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
 
-    cv::imwrite("CUSTOMS.png", src);
     return QString("Length: %1\nWidth: %2").arg(lengthVal, 0, 'f', 2).arg(widthVal, 0, 'f', 2);
 }
 
@@ -1687,22 +1407,30 @@ cv::Point2f CameraWorker::projectToScreen(cv::Point2f localPt, cv::Point2f centr
 }
 
 cv::Point2f CameraWorker::snapToEdgeStraight(cv::Point2f center, cv::Point2f targetPt, const std::vector<cv::Point>& contour) {
-    float dx = targetPt.x - center.x;
-    float dy = targetPt.y - center.y;
-    float length = std::hypot(dx, dy);
-    if (length == 0) return targetPt;
+    const cv::Point2f ray = targetPt - center;
+    const float rayLength = cv::norm(ray);
+    if (rayLength <= std::numeric_limits<float>::epsilon() || contour.size() < 2) return targetPt;
 
-    float ndx = dx / length;
-    float ndy = dy / length;
-    cv::Point2f lastInsidePt = center;
+    const cv::Point2f direction = ray * (1.0f / rayLength);
+    float nearestDistance = std::numeric_limits<float>::max();
+    for (size_t index = 0; index < contour.size(); ++index) {
+        const cv::Point2f segmentStart(contour[index]);
+        const cv::Point2f segmentEnd(contour[(index + 1) % contour.size()]);
+        const cv::Point2f segment = segmentEnd - segmentStart;
+        const cv::Point2f offset = segmentStart - center;
+        const float cross = direction.x * segment.y - direction.y * segment.x;
+        if (std::abs(cross) <= std::numeric_limits<float>::epsilon()) continue;
 
-    for (float d = 0; d < 3000; d += 0.5f) {
-        cv::Point2f testPt(center.x + ndx * d, center.y + ndy * d);
-        double status = cv::pointPolygonTest(contour, testPt, false);
-        if (status < 0) return lastInsidePt;
-        lastInsidePt = testPt;
+        const float rayDistance = (offset.x * segment.y - offset.y * segment.x) / cross;
+        const float segmentPosition = (offset.x * direction.y - offset.y * direction.x) / cross;
+        if (rayDistance >= 0.0f && segmentPosition >= 0.0f && segmentPosition <= 1.0f) {
+            nearestDistance = std::min(nearestDistance, rayDistance);
+        }
     }
-    return targetPt;
+
+    return nearestDistance == std::numeric_limits<float>::max()
+        ? targetPt
+        : center + direction * nearestDistance;
 }
 
 QString CameraWorker::measureGeneralC(cv::Mat &src) {
@@ -1720,10 +1448,7 @@ QString CameraWorker::measureRound(cv::Mat &src) {
     double ppm = getPpm();
     qDebug() << "DEBUG: [measureRound] PPM =" << ppm << "| Input channels =" << src.channels();
 
-    if (src.channels() == 1) {
-        cv::cvtColor(src, src, cv::COLOR_GRAY2BGR);
-        qDebug() << "DEBUG: [measureRound] Converted 1-channel src to BGR.";
-    }
+    if (!ensureBgr8(src)) return "Error: Unsupported image format";
 
     cv::Mat gray, blur, thresh;
     cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
@@ -1735,15 +1460,15 @@ QString CameraWorker::measureRound(cv::Mat &src) {
     qDebug() << "DEBUG: [measureRound] Applied Otsu Thresholding.";
 
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
-    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
     cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
 
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
     qDebug() << "DEBUG: [measureRound] findContours found:" << contours.size() << "contours.";
 
     if (!contours.empty()) {
-        auto largestContour = *std::max_element(contours.begin(), contours.end(),
+        const auto &largestContour = *std::max_element(contours.begin(), contours.end(),
             [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) {
                 return cv::contourArea(a) < cv::contourArea(b);
             });
@@ -1766,8 +1491,6 @@ QString CameraWorker::measureRound(cv::Mat &src) {
             cv::Point textPosition(std::round(center.x) + 15, std::round(center.y) + 5);
             cv::putText(src, resultStr.toStdString(), textPosition, cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
 
-            cv::imwrite("Circle.png", src);
-            qDebug() << "DEBUG: [measureRound] Overlays drawn and image saved as Circle.png. Returning:" << resultStr;
 
             return resultStr;
         } else {

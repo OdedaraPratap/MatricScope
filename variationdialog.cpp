@@ -9,14 +9,19 @@
 #include <QSettings>
 #include <QMessageBox>
 #include <QMouseEvent>
+#include <QGuiApplication>
+#include <QScreen>
+#include <QScroller>
 
 VariationDialog::VariationDialog(QWidget *parent)
     : QDialog(parent), previousGlobalLen(0.0), previousGlobalWid(0.0)
 {
     // Form Core Settings - Scaled to 7-inch Pi Display resolution (800x480)
     setWindowFlags(Qt::FramelessWindowHint | Qt::Dialog);
-    showFullScreen();
-    //setFixedSize(800, 480);
+    if (QScreen *screen = QGuiApplication::primaryScreen()) {
+        setGeometry(screen->geometry());
+    }
+    setWindowState(windowState() | Qt::WindowFullScreen);
     setStyleSheet("QDialog { background-color: #000000; border: 1px solid #555; color: white; }");
 
     QVBoxLayout *mainLayout = new QVBoxLayout(this);
@@ -27,7 +32,7 @@ VariationDialog::VariationDialog(QWidget *parent)
     // 1. CUSTOM ORANGE TITLE BAR
     // ==========================================
     QFrame *titleBar = new QFrame(this);
-    titleBar->setFixedHeight(32);
+    titleBar->setFixedHeight(40);
     titleBar->setStyleSheet("background-color: #FF8000;");
 
     QHBoxLayout *titleLayout = new QHBoxLayout(titleBar);
@@ -37,7 +42,7 @@ VariationDialog::VariationDialog(QWidget *parent)
     lblTitle->setStyleSheet("color: white; font-weight: bold; font-size: 12pt; border: none; background: transparent;");
 
     QPushButton *btnClose = new QPushButton("X", this);
-    btnClose->setFixedSize(23, 23);
+    btnClose->setFixedSize(36, 30);
     btnClose->setStyleSheet("QPushButton { background-color: #DC143C; color: white; font-weight: bold; font-size: 10pt; border: none; } "
                             "QPushButton:hover { background-color: red; }");
 
@@ -49,25 +54,25 @@ VariationDialog::VariationDialog(QWidget *parent)
     // 2. TOOLBAR (Reset All & Two Global Adjusts)
     // ==========================================
     QFrame *toolsPanel = new QFrame(this);
-    toolsPanel->setFixedHeight(38);
+    toolsPanel->setFixedHeight(48);
     toolsPanel->setStyleSheet("background-color: #191919; border: none;");
 
     QHBoxLayout *toolsLayout = new QHBoxLayout(toolsPanel);
-    toolsLayout->setContentsMargins(10, 4, 10, 4);
-    toolsLayout->setSpacing(8);
+    toolsLayout->setContentsMargins(8, 5, 8, 5);
+    toolsLayout->setSpacing(6);
 
     QLabel *lblGlobalLen = new QLabel("All Len +/-", this);
     lblGlobalLen->setStyleSheet("color: #FF8000; font-weight: bold; font-size: 9pt;");
     numGlobalLength = createCustomSpinBox();
-    numGlobalLength->setFixedWidth(75);
+    numGlobalLength->setFixedWidth(82);
 
     QLabel *lblGlobalWid = new QLabel("All Wid +/-", this);
     lblGlobalWid->setStyleSheet("color: #FF8000; font-weight: bold; font-size: 9pt;");
     numGlobalWidth = createCustomSpinBox();
-    numGlobalWidth->setFixedWidth(75);
+    numGlobalWidth->setFixedWidth(82);
 
     QPushButton *btnReset = new QPushButton("RESET ALL", this);
-    btnReset->setFixedSize(85, 24);
+    btnReset->setFixedSize(92, 34);
     btnReset->setStyleSheet("QPushButton { background-color: #DC143C; color: white; font-weight: bold; font-size: 8pt; border: none; border-radius: 3px; } "
                             "QPushButton:pressed { background-color: darkred; }");
 
@@ -84,14 +89,15 @@ VariationDialog::VariationDialog(QWidget *parent)
     QScrollArea *scrollArea = new QScrollArea(this);
     scrollArea->setWidgetResizable(true);
     scrollArea->setStyleSheet("QScrollArea { border: none; background-color: black; } "
-                              "QScrollBar:vertical { background: #111; width: 12px; margin: 0px; } "
-                              "QScrollBar::handle:vertical { background: #FF8000; min-height: 20px; border-radius: 4px; }");
+                              "QScrollBar:vertical { background: #111; width: 22px; margin: 0px; } "
+                              "QScrollBar::handle:vertical { background: #FF8000; min-height: 42px; border-radius: 6px; }");
+    QScroller::grabGesture(scrollArea->viewport(), QScroller::TouchGesture);
 
     QWidget *gridContainer = new QWidget(scrollArea);
     gridContainer->setStyleSheet("background-color: black;");
     QGridLayout *grid = new QGridLayout(gridContainer);
-    grid->setContentsMargins(15, 8, 15, 8);
-    grid->setHorizontalSpacing(25);
+    grid->setContentsMargins(12, 8, 12, 8);
+    grid->setHorizontalSpacing(14);
     grid->setVerticalSpacing(4);
 
     // Headers
@@ -113,18 +119,22 @@ VariationDialog::VariationDialog(QWidget *parent)
 
         lengthCorrections[i] = createCustomSpinBox();
         widthCorrections[i] = createCustomSpinBox();
+        lblRange->setMinimumHeight(34);
 
         grid->addWidget(lblRange, i + 1, 0);
         grid->addWidget(lengthCorrections[i], i + 1, 1);
         grid->addWidget(widthCorrections[i], i + 1, 2);
     }
+    grid->setColumnStretch(0, 2);
+    grid->setColumnStretch(1, 1);
+    grid->setColumnStretch(2, 1);
     scrollArea->setWidget(gridContainer);
 
     // ==========================================
     // 4. SAVE BUTTON
     // ==========================================
     QPushButton *btnSave = new QPushButton("SAVE", this);
-    btnSave->setFixedHeight(38);
+    btnSave->setFixedHeight(44);
     btnSave->setStyleSheet("QPushButton { background-color: #FF8000; color: white; font-weight: bold; font-size: 10pt; border: none; } "
                            "QPushButton:pressed { background-color: #cc6600; }");
 
@@ -152,9 +162,10 @@ QDoubleSpinBox* VariationDialog::createCustomSpinBox()
     box->setDecimals(3);
     box->setSingleStep(0.005);
     box->setRange(-5.000, 5.000);
-    box->setFixedWidth(90);
-    box->setStyleSheet("QDoubleSpinBox { background-color: black; color: white; border: 1px solid #555; font-size: 9pt; padding: 2px; }"
-                       "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { background-color: #333; width: 16px; }"
+    box->setFixedWidth(96);
+    box->setMinimumHeight(32);
+    box->setStyleSheet("QDoubleSpinBox { background-color: black; color: white; border: 1px solid #555; font-size: 10pt; padding: 2px; }"
+                       "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { background-color: #333; width: 24px; }"
                        "QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover { background-color: #FF8000; }");
     return box;
 }

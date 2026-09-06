@@ -4,7 +4,8 @@
 #include <QMutex>
 #include <QImage>
 #include <QString>
-#include <QElapsedTimer>
+#include <QFuture>
+#include <atomic>
 #include <opencv2/opencv.hpp>
 #include "MvCameraControl.h"
 
@@ -56,7 +57,7 @@ public:
 
 private:
     void handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFrameInfo);
-    void resetSnapshotState();
+    void resetSnapshotState(bool forceStatusUpdate = false);
 
     void doCalibration(cv::Mat &src);
     void processFrame(cv::Mat &frame);
@@ -84,6 +85,9 @@ private:
 
     QMutex m_mutex;
     bool m_running;
+    std::atomic_bool m_processingFrame{false};
+    std::atomic<long long> m_lastUiFrameMs{0};
+    QFuture<void> m_processingFuture;
     MeasurementMode m_mode;
     double m_ppm;
     int m_thresholdValue;
@@ -93,15 +97,11 @@ private:
 
     cv::Mat m_backgroundGray;
     cv::Mat m_latestFrame;
+    cv::Mat m_measurementOverlay;
+    cv::Mat m_measurementOverlayMask;
     bool m_captureFlag = false;
     bool m_calibrationFlag = false;
     bool m_settingsChanged = false;
-
-    cv::Mat m_lastProcessedFrame;
-    bool m_isRenderingSnapshot = false;
-
-    QElapsedTimer m_stopWatch;
-    QElapsedTimer m_uiTimer;
 
     double m_currentExposure = 100.0;
     double m_currentGain = 10.0;
@@ -110,5 +110,5 @@ private:
     ShapeData m_activeCustomShape;
     void *m_devHandle = nullptr;
     const double MOVEMENT_THRESHOLD = 3.0;
-    const int FRAMES_TO_STABILIZE = 5;
+    const int FRAMES_TO_STABILIZE = 3;
 };
