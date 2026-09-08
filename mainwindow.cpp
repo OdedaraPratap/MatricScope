@@ -2,6 +2,7 @@
 #include "calibrationdialog.h"
 #include "camerasettingdialog.h"
 #include "customshapedialog.h"
+#include "databasehelper.h"
 #include <QMessageBox>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -19,6 +20,7 @@
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent), m_activeMode(MeasurementMode::GeneralC)
 {
+    DatabaseHelper::initializeDatabase();
     showFullScreen();
     setStyleSheet("QMainWindow { background-color: #000000; color: white; }");
 
@@ -29,9 +31,12 @@ MainWindow::MainWindow(QWidget *parent)
     populateCustomShapesMenu();
 
     m_cameraWorker = new CameraWorker(this);
-        connect(m_cameraWorker, &CameraWorker::frameReady, this, &MainWindow::updateCameraFeed);
-        connect(m_cameraWorker, &CameraWorker::measurementResult, this, &MainWindow::handleMeasurement);
-        connect(m_cameraWorker, &CameraWorker::statusUpdated, this, &MainWindow::updateMeasurementUI);
+    connect(m_cameraWorker, &CameraWorker::frameReady,
+            this, &MainWindow::updateCameraFeed, Qt::QueuedConnection);
+    connect(m_cameraWorker, &CameraWorker::measurementResult,
+            this, &MainWindow::handleMeasurement, Qt::QueuedConnection);
+    connect(m_cameraWorker, &CameraWorker::statusUpdated,
+            this, &MainWindow::updateMeasurementUI, Qt::QueuedConnection);
     m_cameraWorker->start();
 }
 
@@ -301,16 +306,15 @@ void MainWindow::populateCustomShapesMenu() {
     }
 
     if (db.open()) {
-        QSqlQuery query("SELECT Name, ImagePath FROM Shapes");
-        bool foundShapes = false;
-        while (query.next()) {
-            foundShapes = true;
-            QString shapeName = query.value(0).toString();
-            QString imagePath = query.value(1).toString();
+        const QVector<ShapeData> shapes = DatabaseHelper::getAllShapes();
+        for (const ShapeData &shape : shapes) {
+            const QString shapeName = shape.Name;
+            const QString imagePath = shape.ImagePath;
 
             QAction *action = m_customShapesMenu->addAction(shapeName);
-            connect(action, &QAction::triggered, this, [this, shapeName, imagePath]() {
+            connect(action, &QAction::triggered, this, [this, shape, shapeName, imagePath]() {
                 m_activeMode = MeasurementMode::Custom;
+                m_cameraWorker->setActiveCustomShape(shape);
                 m_cameraWorker->setMode(MeasurementMode::Custom);
                 updateMeasurementUI("Active Custom Shape: " + shapeName);
                 if (!imagePath.isEmpty() && QFile::exists(imagePath)) {
@@ -318,7 +322,7 @@ void MainWindow::populateCustomShapesMenu() {
                 }
             });
         }
-        if (!foundShapes) {
+        if (shapes.isEmpty()) {
             QAction *noAction = m_customShapesMenu->addAction("No Custom Shapes Saved");
             noAction->setEnabled(false);
         }
