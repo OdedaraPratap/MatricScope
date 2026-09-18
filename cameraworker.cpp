@@ -834,9 +834,24 @@ void CameraWorker::requestCalibration() {
 }
 
 double CameraWorker::getPpm() {
+    double ppm = 1.0;
+    return tryGetPpm(ppm) ? ppm : 1.0;
+}
+
+bool CameraWorker::tryGetPpm(double &ppm) const {
     QSettings settings("MetricScope", "Settings");
-    double p = settings.value("ppm", 1.0).toDouble();
-    return (p <= 0) ? 1.0 : p;
+    if (!settings.contains("ppm")) {
+        return false;
+    }
+
+    bool converted = false;
+    const double storedPpm = settings.value("ppm").toDouble(&converted);
+    if (!converted || !std::isfinite(storedPpm) || storedPpm <= 0.0) {
+        return false;
+    }
+
+    ppm = storedPpm;
+    return true;
 }
 
 double CameraWorker::applyVariation(double rawMeasurementMM, bool isLength) {
@@ -1504,7 +1519,13 @@ void CameraWorker::getInvariantTransform(const std::vector<cv::Point>& hull, cv:
 // ============================================================================
 QString CameraWorker::measurePolygon(cv::Mat &src) {
     if (src.empty()) return "No Image Data";
-    double ppm = getPpm();
+
+    // QSettings is the Qt equivalent of the registry-backed calibration store
+    // used by the original C# implementation. Do not measure with a made-up
+    // default when the saved calibration is absent or invalid.
+    double ppm = 0.0;
+    if (!tryGetPpm(ppm)) return "Calibration Error";
+
     if (src.channels() == 1) {
             cv::cvtColor(src, src, cv::COLOR_GRAY2BGR);
     }
