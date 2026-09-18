@@ -177,6 +177,10 @@ void CameraWorker::run() {
     if (nRet != MV_OK) {
         qDebug() << "DEBUG: Error - Failed to register camera callback. Return:" << nRet;
         emit statusUpdated("Error: Failed to register camera callback.");
+        MV_CC_CloseDevice(m_devHandle);
+        MV_CC_DestroyHandle(m_devHandle);
+        m_devHandle = nullptr;
+        return;
     } else {
         qDebug() << "DEBUG: Image callback registered successfully.";
     }
@@ -186,13 +190,18 @@ void CameraWorker::run() {
     if (nRet != MV_OK) {
         qDebug() << "DEBUG: Error - Failed to start grabbing. Return:" << nRet;
         emit statusUpdated("Error: Failed to start grabbing.");
+        MV_CC_CloseDevice(m_devHandle);
+        MV_CC_DestroyHandle(m_devHandle);
+        m_devHandle = nullptr;
+        return;
     } else {
         qDebug() << "DEBUG: Hikrobot Camera Streaming started successfully.";
         emit statusUpdated("Hikrobot Camera Streaming...");
     }
     m_stopWatch.start();
     m_uiTimer.start();
-    qint64 nextDiagnosticsMs = monotonicMs();
+    const qint64 streamingStartedMs = monotonicMs();
+    qint64 nextDiagnosticsMs = streamingStartedMs;
     quint64 previousCallbackCount = 0;
     quint64 previousDisplayCount = 0;
     // Keep thread alive while running
@@ -220,12 +229,15 @@ void CameraWorker::run() {
             const qint64 lastDisplay = m_lastDisplayMs.load();
             const qint64 callbackAge = lastCallback == 0 ? -1 : now - lastCallback;
             const qint64 displayAge = lastDisplay == 0 ? -1 : now - lastDisplay;
-            const bool sdkHealthy = callbackAge >= 0 && callbackAge < 2000;
+            const bool starting = lastCallback == 0 && now - streamingStartedMs < 3000;
+            const bool sdkHealthy = starting || (callbackAge >= 0 && callbackAge < 2000);
             const bool displayHealthy = displayAge >= 0 && displayAge < 2000;
-            const bool healthy = sdkHealthy && displayHealthy;
-            const QString pipelineState = !sdkHealthy
+            const bool healthy = starting || (sdkHealthy && displayHealthy);
+            const QString pipelineState = starting
+                ? QStringLiteral("STARTING")
+                : (!sdkHealthy
                 ? QStringLiteral("SDK STALLED")
-                : (!displayHealthy ? QStringLiteral("RENDER STALLED") : QStringLiteral("OK"));
+                : (!displayHealthy ? QStringLiteral("RENDER STALLED") : QStringLiteral("OK")));
 
             const QString callbackState = lastCallback == 0
                 ? QStringLiteral("waiting")
@@ -234,13 +246,14 @@ void CameraWorker::run() {
                 ? QStringLiteral("waiting")
                 : QString("%1 ms ago").arg(displayAge);
             const QString diagnostics = QString(
-                "CAMERA %1 | SDK: %2 fps, last %3 | UI: %4 fps, last %5 | processing: %6")
+                "CAMERA %1 | SDK: %2 fps, last %3 | UI: %4 fps, last %5 | processing: %6 | skipped: %7")
                 .arg(pipelineState)
                 .arg(callbacks - previousCallbackCount)
                 .arg(callbackState)
                 .arg(displayed - previousDisplayCount)
                 .arg(displayState)
-                .arg(m_processingJobs.load());
+                .arg(m_processingJobs.load())
+                .arg(m_droppedProcessingFrames.load());
 
             emit diagnosticsUpdated(diagnostics, healthy);
             qDebug().noquote() << "DEBUG:" << diagnostics;
@@ -441,13 +454,19 @@ void CameraWorker::handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFram
 
     // 4. HIGH-SPEED ALGORITHM PROCESSING ENGINE (Equivalent to C# Task.Run)
     if (doProcess && !processingCopy.empty()) {
-        // Launch processing on a separate thread pool thread so the camera callback never blocks!
-        m_processingJobs.fetch_add(1);
-        QtConcurrent::run([this, processingCopy]() {
-            cv::Mat frameToProcess = processingCopy;
-            this->processFrame(frameToProcess);
-            m_processingJobs.fetch_sub(1);
-        });
+        // Only one analysis job may run at once. Queuing a job for every camera
+        // frame can exhaust the thread pool and memory, eventually freezing the
+        // UI even though the camera is still delivering frames.
+        int expectedJobs = 0;
+        if (m_processingJobs.compare_exchange_strong(expectedJobs, 1)) {
+            QtConcurrent::run([this, processingCopy]() {
+                cv::Mat frameToProcess = processingCopy;
+                this->processFrame(frameToProcess);
+                m_processingJobs.store(0);
+            });
+        } else {
+            m_droppedProcessingFrames.fetch_add(1);
+        }
     }
 
     // 5. UNIFIED DISPLAY RENDERING PIPELINE (Equivalent to C# BeginInvoke)

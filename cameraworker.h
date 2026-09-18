@@ -119,6 +119,7 @@ private:
     std::atomic<int> m_processingJobs{0};
     std::atomic<qint64> m_lastCallbackMs{0};
     std::atomic<qint64> m_lastDisplayMs{0};
+    std::atomic<quint64> m_droppedProcessingFrames{0};
 
     static qint64 monotonicMs();
     const double MOVEMENT_THRESHOLD = 3.0;

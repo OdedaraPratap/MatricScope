@@ -140,7 +140,7 @@ void MainWindow::setupUi() {
         "color: #FFCC00; background-color: #202020; padding: 4px; font: bold 9pt monospace;");
     m_cameraDiagnostics->setToolTip(
         "SDK shows whether the camera is delivering frames. UI shows whether frames are being rendered. "
-        "A growing processing count indicates processing congestion.");
+        "Processing is limited to one job; skipped counts frames intentionally omitted while that job was busy.");
 
     centerLayout->addWidget(topBar);
     centerLayout->addWidget(m_cameraFeed, 1);
