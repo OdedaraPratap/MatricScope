@@ -98,6 +98,15 @@ cv::Mat CameraWorker::getLatestFrame() {
     return m_latestFrame.clone();
 }
 
+void CameraWorker::notifyFrameDisplayed()
+{
+    // Called by the GUI only after it has actually converted/scaled the image.
+    // This makes the UI diagnostics measure presentation rather than emission.
+    m_displayFrameCount.fetch_add(1);
+    m_lastDisplayMs.store(monotonicMs());
+    m_uiFramePending.store(false);
+}
+
 void CameraWorker::updateCameraSettings(int exposure, int gain, int gamma) {
     QMutexLocker locker(&m_mutex);
     qDebug() << "DEBUG: updateCameraSettings called -> Exposure:" << exposure << "Gain:" << gain << "Gamma:" << gamma;
@@ -511,11 +520,17 @@ void CameraWorker::handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFram
     }
 
     // 5. UNIFIED DISPLAY RENDERING PIPELINE (Equivalent to C# BeginInvoke)
-    QImage qimg = matToQImage(displayMat);
-    if (!qimg.isNull()) {
-        m_displayFrameCount.fetch_add(1);
-        m_lastDisplayMs.store(monotonicMs());
-        emit frameReady(qimg);
+    if (!m_uiFramePending.exchange(true)) {
+        // Keep at most one full-resolution image in Qt's queued connection.
+        // Without this backpressure the GUI event queue can grow indefinitely:
+        // the displayed image falls further behind, memory grows, and eventually
+        // the whole application appears frozen even while callbacks are running.
+        QImage qimg = matToQImage(displayMat);
+        if (!qimg.isNull()) {
+            emit frameReady(qimg);
+        } else {
+            m_uiFramePending.store(false);
+        }
     }
 }
 void CameraWorker::doCalibration(cv::Mat &src)

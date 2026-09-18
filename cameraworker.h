@@ -43,6 +43,7 @@ public:
     void updateCameraSettings(int exposure, int gain, int gamma);
     void requestCalibration();
     double getPpm();
+    void notifyFrameDisplayed();
 
 signals:
     void frameReady(const QImage &image);
@@ -120,6 +121,7 @@ private:
     std::atomic<qint64> m_lastCallbackMs{0};
     std::atomic<qint64> m_lastDisplayMs{0};
     std::atomic<quint64> m_droppedProcessingFrames{0};
+    std::atomic<bool> m_uiFramePending{false};
 
     static qint64 monotonicMs();
     const double MOVEMENT_THRESHOLD = 3.0;

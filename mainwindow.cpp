@@ -439,6 +439,7 @@ void MainWindow::onStopClicked() {
 
 void MainWindow::updateCameraFeed(const QImage &img) {
     m_cameraFeed->setPixmap(QPixmap::fromImage(img).scaled(m_cameraFeed->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    m_cameraWorker->notifyFrameDisplayed();
 }
 
 void MainWindow::updateCameraDiagnostics(const QString &diagnostics, bool healthy) {
