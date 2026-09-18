@@ -15,6 +15,12 @@
 #include <cstdlib>
 #include <QtConcurrentRun>
 
+qint64 CameraWorker::monotonicMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 CameraWorker::CameraWorker(QObject *parent)
     : QThread(parent), m_running(true), m_mutex(QMutex::Recursive),m_mode(MeasurementMode::None),
       m_ppm(100.0), m_thresholdValue(25), m_lastCentroid(0, 0),
@@ -186,6 +192,9 @@ void CameraWorker::run() {
     }
     m_stopWatch.start();
     m_uiTimer.start();
+    qint64 nextDiagnosticsMs = monotonicMs();
+    quint64 previousCallbackCount = 0;
+    quint64 previousDisplayCount = 0;
     // Keep thread alive while running
     while (true) {
         {
@@ -201,6 +210,43 @@ void CameraWorker::run() {
                 m_settingsChanged = false;
                 qDebug() << "DEBUG: Applied deferred camera settings update.";
             }
+        }
+
+        const qint64 now = monotonicMs();
+        if (now >= nextDiagnosticsMs) {
+            const quint64 callbacks = m_callbackCount.load();
+            const quint64 displayed = m_displayFrameCount.load();
+            const qint64 lastCallback = m_lastCallbackMs.load();
+            const qint64 lastDisplay = m_lastDisplayMs.load();
+            const qint64 callbackAge = lastCallback == 0 ? -1 : now - lastCallback;
+            const qint64 displayAge = lastDisplay == 0 ? -1 : now - lastDisplay;
+            const bool sdkHealthy = callbackAge >= 0 && callbackAge < 2000;
+            const bool displayHealthy = displayAge >= 0 && displayAge < 2000;
+            const bool healthy = sdkHealthy && displayHealthy;
+            const QString pipelineState = !sdkHealthy
+                ? QStringLiteral("SDK STALLED")
+                : (!displayHealthy ? QStringLiteral("RENDER STALLED") : QStringLiteral("OK"));
+
+            const QString callbackState = lastCallback == 0
+                ? QStringLiteral("waiting")
+                : QString("%1 ms ago").arg(callbackAge);
+            const QString displayState = lastDisplay == 0
+                ? QStringLiteral("waiting")
+                : QString("%1 ms ago").arg(displayAge);
+            const QString diagnostics = QString(
+                "CAMERA %1 | SDK: %2 fps, last %3 | UI: %4 fps, last %5 | processing: %6")
+                .arg(pipelineState)
+                .arg(callbacks - previousCallbackCount)
+                .arg(callbackState)
+                .arg(displayed - previousDisplayCount)
+                .arg(displayState)
+                .arg(m_processingJobs.load());
+
+            emit diagnosticsUpdated(diagnostics, healthy);
+            qDebug().noquote() << "DEBUG:" << diagnostics;
+            previousCallbackCount = callbacks;
+            previousDisplayCount = displayed;
+            nextDiagnosticsMs = now + 1000;
         }
         QThread::msleep(100);
     }
@@ -320,6 +366,9 @@ void __stdcall CameraWorker::ImageCallBackEx(unsigned char *pData, MV_FRAME_OUT_
 void CameraWorker::handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFrameInfo) {
     if (!pData || !pFrameInfo) return;
 
+    m_callbackCount.fetch_add(1);
+    m_lastCallbackMs.store(monotonicMs());
+
     // 1. Top-Level Throttle to 50ms (~20 FPS) exactly like C#
     if (m_stopWatch.isValid() && m_stopWatch.elapsed() < 50) {
         return;
@@ -393,15 +442,19 @@ void CameraWorker::handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFram
     // 4. HIGH-SPEED ALGORITHM PROCESSING ENGINE (Equivalent to C# Task.Run)
     if (doProcess && !processingCopy.empty()) {
         // Launch processing on a separate thread pool thread so the camera callback never blocks!
+        m_processingJobs.fetch_add(1);
         QtConcurrent::run([this, processingCopy]() {
             cv::Mat frameToProcess = processingCopy;
             this->processFrame(frameToProcess);
+            m_processingJobs.fetch_sub(1);
         });
     }
 
     // 5. UNIFIED DISPLAY RENDERING PIPELINE (Equivalent to C# BeginInvoke)
     QImage qimg = matToQImage(displayMat);
     if (!qimg.isNull()) {
+        m_displayFrameCount.fetch_add(1);
+        m_lastDisplayMs.store(monotonicMs());
         emit frameReady(qimg);
     }
 }

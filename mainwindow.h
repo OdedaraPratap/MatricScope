@@ -26,6 +26,7 @@ private slots:
     void updateCameraFeed(const QImage &img);
     void handleMeasurement(const QString &resultText, double length, double width); // 3-Argument Slot
     void updateMeasurementUI(const QString &resultText);
+    void updateCameraDiagnostics(const QString &diagnostics, bool healthy);
     void onBlankBgClicked();
     void onCalibClicked();
     void onSettingsClicked();
@@ -46,6 +47,7 @@ private:
     void onProfileComboChanged(const QString &fileName);
 
     QLabel *m_cameraFeed;
+    QLabel *m_cameraDiagnostics;
     QLabel *m_picPreview;
 
     QLabel *lblLengthTitle;
