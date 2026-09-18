@@ -61,6 +61,7 @@ private:
     void doCalibration(cv::Mat &src);
     void processFrame(cv::Mat &frame);
     void triggerAutoMeasurement(cv::Mat &frame);
+    bool tryGetPpm(double &ppm) const;
     double applyVariation(double rawMeasurementMM, bool isLength);
     void triggerPiGpioOutput(int boxNumber);
     QImage matToQImage(const cv::Mat &mat);
