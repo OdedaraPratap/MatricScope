@@ -200,7 +200,9 @@ void CameraWorker::run() {
     }
     m_stopWatch.start();
     m_uiTimer.start();
-    const qint64 streamingStartedMs = monotonicMs();
+    qint64 streamingStartedMs = monotonicMs();
+    qint64 lastRecoveryAttemptMs = 0;
+    unsigned int recoveryAttempts = 0;
     qint64 nextDiagnosticsMs = streamingStartedMs;
     quint64 previousCallbackCount = 0;
     quint64 previousDisplayCount = 0;
@@ -227,33 +229,72 @@ void CameraWorker::run() {
             const quint64 displayed = m_displayFrameCount.load();
             const qint64 lastCallback = m_lastCallbackMs.load();
             const qint64 lastDisplay = m_lastDisplayMs.load();
-            const qint64 callbackAge = lastCallback == 0 ? -1 : now - lastCallback;
-            const qint64 displayAge = lastDisplay == 0 ? -1 : now - lastDisplay;
+            qint64 callbackAge = lastCallback == 0 ? -1 : now - lastCallback;
+            qint64 displayAge = lastDisplay == 0 ? -1 : now - lastDisplay;
+            const bool callbackTimedOut = (lastCallback == 0 && now - streamingStartedMs >= 3000)
+                || callbackAge >= 3000;
+            bool recovering = false;
+            int recoveryStopResult = MV_OK;
+            int recoveryStartResult = MV_OK;
+
+            // The SDK occasionally stops invoking its callback while the device
+            // remains open. Restart acquisition here instead of only reporting
+            // the stall. Rate limiting avoids continuously hammering the SDK if
+            // the camera has actually been disconnected.
+            if (callbackTimedOut && (lastRecoveryAttemptMs == 0 || now - lastRecoveryAttemptMs >= 5000)) {
+                lastRecoveryAttemptMs = now;
+                ++recoveryAttempts;
+                recoveryStopResult = MV_CC_StopGrabbing(m_devHandle);
+                recoveryStartResult = MV_CC_StartGrabbing(m_devHandle);
+                recovering = recoveryStartResult == MV_OK;
+
+                qDebug() << "DEBUG: Camera callback stalled; acquisition restart attempt"
+                         << recoveryAttempts << "StopGrabbing:" << recoveryStopResult
+                         << "StartGrabbing:" << recoveryStartResult;
+
+                if (recovering) {
+                    // Give the restarted stream the same grace period as initial
+                    // startup and wait for a genuinely new callback.
+                    m_lastCallbackMs.store(0);
+                    m_lastDisplayMs.store(0);
+                    streamingStartedMs = now;
+                    callbackAge = -1;
+                    displayAge = -1;
+                }
+            }
             const bool starting = lastCallback == 0 && now - streamingStartedMs < 3000;
-            const bool sdkHealthy = starting || (callbackAge >= 0 && callbackAge < 2000);
+            const bool sdkHealthy = recovering || starting || (callbackAge >= 0 && callbackAge < 2000);
             const bool displayHealthy = displayAge >= 0 && displayAge < 2000;
-            const bool healthy = starting || (sdkHealthy && displayHealthy);
-            const QString pipelineState = starting
+            const bool healthy = recovering || starting || (sdkHealthy && displayHealthy);
+            const QString pipelineState = recovering
+                ? QStringLiteral("RECOVERING")
+                : (starting
                 ? QStringLiteral("STARTING")
                 : (!sdkHealthy
                 ? QStringLiteral("SDK STALLED")
-                : (!displayHealthy ? QStringLiteral("RENDER STALLED") : QStringLiteral("OK")));
+                : (!displayHealthy ? QStringLiteral("RENDER STALLED") : QStringLiteral("OK"))));
 
-            const QString callbackState = lastCallback == 0
+            const QString callbackState = callbackAge < 0
                 ? QStringLiteral("waiting")
                 : QString("%1 ms ago").arg(callbackAge);
-            const QString displayState = lastDisplay == 0
+            const QString displayState = displayAge < 0
                 ? QStringLiteral("waiting")
                 : QString("%1 ms ago").arg(displayAge);
             const QString diagnostics = QString(
-                "CAMERA %1 | SDK: %2 fps, last %3 | UI: %4 fps, last %5 | processing: %6 | skipped: %7")
+                "CAMERA %1 | SDK: %2 fps, last %3 | UI: %4 fps, last %5 | processing: %6 | skipped: %7 | restarts: %8")
                 .arg(pipelineState)
                 .arg(callbacks - previousCallbackCount)
                 .arg(callbackState)
                 .arg(displayed - previousDisplayCount)
                 .arg(displayState)
                 .arg(m_processingJobs.load())
-                .arg(m_droppedProcessingFrames.load());
+                .arg(m_droppedProcessingFrames.load())
+                .arg(recoveryAttempts);
+
+            if (callbackTimedOut && !recovering && recoveryStartResult != MV_OK) {
+                qWarning() << "Camera acquisition restart failed. SDK return:"
+                           << recoveryStartResult;
+            }
 
             emit diagnosticsUpdated(diagnostics, healthy);
             qDebug().noquote() << "DEBUG:" << diagnostics;
