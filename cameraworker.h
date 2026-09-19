@@ -5,6 +5,8 @@
 #include <QImage>
 #include <QString>
 #include <QElapsedTimer>
+#include <atomic>
+#include <chrono>
 #include <opencv2/opencv.hpp>
 #include "MvCameraControl.h"
 
@@ -41,10 +43,14 @@ public:
     void updateCameraSettings(int exposure, int gain, int gamma);
     void requestCalibration();
     double getPpm();
+    void notifyFrameDisplayed();
 
 signals:
     void frameReady(const QImage &image);
     void statusUpdated(const QString &status);
+    // Periodic camera-pipeline health information. This remains active even if
+    // the SDK stops delivering frames, so a freeze can be diagnosed on screen.
+    void diagnosticsUpdated(const QString &diagnostics, bool healthy);
     void measurementResult(const QString &resultText, double length, double width); // 3-Argument Signal
 
 protected:
@@ -109,6 +115,15 @@ private:
 
     ShapeData m_activeCustomShape;
     void *m_devHandle = nullptr;
+    std::atomic<quint64> m_callbackCount{0};
+    std::atomic<quint64> m_displayFrameCount{0};
+    std::atomic<int> m_processingJobs{0};
+    std::atomic<qint64> m_lastCallbackMs{0};
+    std::atomic<qint64> m_lastDisplayMs{0};
+    std::atomic<quint64> m_droppedProcessingFrames{0};
+    std::atomic<bool> m_uiFramePending{false};
+
+    static qint64 monotonicMs();
     const double MOVEMENT_THRESHOLD = 3.0;
     const int FRAMES_TO_STABILIZE = 5;
 };

@@ -32,6 +32,7 @@ MainWindow::MainWindow(QWidget *parent)
         connect(m_cameraWorker, &CameraWorker::frameReady, this, &MainWindow::updateCameraFeed);
         connect(m_cameraWorker, &CameraWorker::measurementResult, this, &MainWindow::handleMeasurement);
         connect(m_cameraWorker, &CameraWorker::statusUpdated, this, &MainWindow::updateMeasurementUI);
+        connect(m_cameraWorker, &CameraWorker::diagnosticsUpdated, this, &MainWindow::updateCameraDiagnostics);
     m_cameraWorker->start();
 }
 
@@ -133,8 +134,17 @@ void MainWindow::setupUi() {
     m_cameraFeed->setAlignment(Qt::AlignCenter);
     m_cameraFeed->setText("INITIALIZING CAMERA...");
 
+    m_cameraDiagnostics = new QLabel("CAMERA: waiting for diagnostics...", this);
+    m_cameraDiagnostics->setAlignment(Qt::AlignCenter);
+    m_cameraDiagnostics->setStyleSheet(
+        "color: #FFCC00; background-color: #202020; padding: 4px; font: bold 9pt monospace;");
+    m_cameraDiagnostics->setToolTip(
+        "SDK shows whether the camera is delivering frames. UI shows whether frames are being rendered. "
+        "Processing is limited to one job; skipped counts frames intentionally omitted while that job was busy.");
+
     centerLayout->addWidget(topBar);
     centerLayout->addWidget(m_cameraFeed, 1);
+    centerLayout->addWidget(m_cameraDiagnostics);
 
     // ==========================================
     // 3. RIGHT PANEL (Actions, Custom Shapes Menu & Shutdown)
@@ -429,6 +439,14 @@ void MainWindow::onStopClicked() {
 
 void MainWindow::updateCameraFeed(const QImage &img) {
     m_cameraFeed->setPixmap(QPixmap::fromImage(img).scaled(m_cameraFeed->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    m_cameraWorker->notifyFrameDisplayed();
+}
+
+void MainWindow::updateCameraDiagnostics(const QString &diagnostics, bool healthy) {
+    m_cameraDiagnostics->setText(diagnostics);
+    m_cameraDiagnostics->setStyleSheet(QString(
+        "color: %1; background-color: #202020; padding: 4px; font: bold 9pt monospace;")
+        .arg(healthy ? "#66FF66" : "#FF5555"));
 }
 
 void MainWindow::handleMeasurement(const QString &resultText, double length, double width) {

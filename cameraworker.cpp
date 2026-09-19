@@ -15,6 +15,12 @@
 #include <cstdlib>
 #include <QtConcurrentRun>
 
+qint64 CameraWorker::monotonicMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 CameraWorker::CameraWorker(QObject *parent)
     : QThread(parent), m_running(true), m_mutex(QMutex::Recursive),m_mode(MeasurementMode::None),
       m_ppm(100.0), m_thresholdValue(25), m_lastCentroid(0, 0),
@@ -90,6 +96,15 @@ cv::Mat CameraWorker::getLatestFrame() {
         qDebug() << "DEBUG: getLatestFrame() called, but m_latestFrame is empty!";
     }
     return m_latestFrame.clone();
+}
+
+void CameraWorker::notifyFrameDisplayed()
+{
+    // Called by the GUI only after it has actually converted/scaled the image.
+    // This makes the UI diagnostics measure presentation rather than emission.
+    m_displayFrameCount.fetch_add(1);
+    m_lastDisplayMs.store(monotonicMs());
+    m_uiFramePending.store(false);
 }
 
 void CameraWorker::updateCameraSettings(int exposure, int gain, int gamma) {
@@ -171,6 +186,10 @@ void CameraWorker::run() {
     if (nRet != MV_OK) {
         qDebug() << "DEBUG: Error - Failed to register camera callback. Return:" << nRet;
         emit statusUpdated("Error: Failed to register camera callback.");
+        MV_CC_CloseDevice(m_devHandle);
+        MV_CC_DestroyHandle(m_devHandle);
+        m_devHandle = nullptr;
+        return;
     } else {
         qDebug() << "DEBUG: Image callback registered successfully.";
     }
@@ -180,12 +199,22 @@ void CameraWorker::run() {
     if (nRet != MV_OK) {
         qDebug() << "DEBUG: Error - Failed to start grabbing. Return:" << nRet;
         emit statusUpdated("Error: Failed to start grabbing.");
+        MV_CC_CloseDevice(m_devHandle);
+        MV_CC_DestroyHandle(m_devHandle);
+        m_devHandle = nullptr;
+        return;
     } else {
         qDebug() << "DEBUG: Hikrobot Camera Streaming started successfully.";
         emit statusUpdated("Hikrobot Camera Streaming...");
     }
     m_stopWatch.start();
     m_uiTimer.start();
+    qint64 streamingStartedMs = monotonicMs();
+    qint64 lastRecoveryAttemptMs = 0;
+    unsigned int recoveryAttempts = 0;
+    qint64 nextDiagnosticsMs = streamingStartedMs;
+    quint64 previousCallbackCount = 0;
+    quint64 previousDisplayCount = 0;
     // Keep thread alive while running
     while (true) {
         {
@@ -201,6 +230,86 @@ void CameraWorker::run() {
                 m_settingsChanged = false;
                 qDebug() << "DEBUG: Applied deferred camera settings update.";
             }
+        }
+
+        const qint64 now = monotonicMs();
+        if (now >= nextDiagnosticsMs) {
+            const quint64 callbacks = m_callbackCount.load();
+            const quint64 displayed = m_displayFrameCount.load();
+            const qint64 lastCallback = m_lastCallbackMs.load();
+            const qint64 lastDisplay = m_lastDisplayMs.load();
+            qint64 callbackAge = lastCallback == 0 ? -1 : now - lastCallback;
+            qint64 displayAge = lastDisplay == 0 ? -1 : now - lastDisplay;
+            const bool callbackTimedOut = (lastCallback == 0 && now - streamingStartedMs >= 3000)
+                || callbackAge >= 3000;
+            bool recovering = false;
+            int recoveryStopResult = MV_OK;
+            int recoveryStartResult = MV_OK;
+
+            // The SDK occasionally stops invoking its callback while the device
+            // remains open. Restart acquisition here instead of only reporting
+            // the stall. Rate limiting avoids continuously hammering the SDK if
+            // the camera has actually been disconnected.
+            if (callbackTimedOut && (lastRecoveryAttemptMs == 0 || now - lastRecoveryAttemptMs >= 5000)) {
+                lastRecoveryAttemptMs = now;
+                ++recoveryAttempts;
+                recoveryStopResult = MV_CC_StopGrabbing(m_devHandle);
+                recoveryStartResult = MV_CC_StartGrabbing(m_devHandle);
+                recovering = recoveryStartResult == MV_OK;
+
+                qDebug() << "DEBUG: Camera callback stalled; acquisition restart attempt"
+                         << recoveryAttempts << "StopGrabbing:" << recoveryStopResult
+                         << "StartGrabbing:" << recoveryStartResult;
+
+                if (recovering) {
+                    // Give the restarted stream the same grace period as initial
+                    // startup and wait for a genuinely new callback.
+                    m_lastCallbackMs.store(0);
+                    m_lastDisplayMs.store(0);
+                    streamingStartedMs = now;
+                    callbackAge = -1;
+                    displayAge = -1;
+                }
+            }
+            const bool starting = lastCallback == 0 && now - streamingStartedMs < 3000;
+            const bool sdkHealthy = recovering || starting || (callbackAge >= 0 && callbackAge < 2000);
+            const bool displayHealthy = displayAge >= 0 && displayAge < 2000;
+            const bool healthy = recovering || starting || (sdkHealthy && displayHealthy);
+            const QString pipelineState = recovering
+                ? QStringLiteral("RECOVERING")
+                : (starting
+                ? QStringLiteral("STARTING")
+                : (!sdkHealthy
+                ? QStringLiteral("SDK STALLED")
+                : (!displayHealthy ? QStringLiteral("RENDER STALLED") : QStringLiteral("OK"))));
+
+            const QString callbackState = callbackAge < 0
+                ? QStringLiteral("waiting")
+                : QString("%1 ms ago").arg(callbackAge);
+            const QString displayState = displayAge < 0
+                ? QStringLiteral("waiting")
+                : QString("%1 ms ago").arg(displayAge);
+            const QString diagnostics = QString(
+                "CAMERA %1 | SDK: %2 fps, last %3 | UI: %4 fps, last %5 | processing: %6 | skipped: %7 | restarts: %8")
+                .arg(pipelineState)
+                .arg(callbacks - previousCallbackCount)
+                .arg(callbackState)
+                .arg(displayed - previousDisplayCount)
+                .arg(displayState)
+                .arg(m_processingJobs.load())
+                .arg(m_droppedProcessingFrames.load())
+                .arg(recoveryAttempts);
+
+            if (callbackTimedOut && !recovering && recoveryStartResult != MV_OK) {
+                qWarning() << "Camera acquisition restart failed. SDK return:"
+                           << recoveryStartResult;
+            }
+
+            emit diagnosticsUpdated(diagnostics, healthy);
+            qDebug().noquote() << "DEBUG:" << diagnostics;
+            previousCallbackCount = callbacks;
+            previousDisplayCount = displayed;
+            nextDiagnosticsMs = now + 1000;
         }
         QThread::msleep(100);
     }
@@ -320,6 +429,9 @@ void __stdcall CameraWorker::ImageCallBackEx(unsigned char *pData, MV_FRAME_OUT_
 void CameraWorker::handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFrameInfo) {
     if (!pData || !pFrameInfo) return;
 
+    m_callbackCount.fetch_add(1);
+    m_lastCallbackMs.store(monotonicMs());
+
     // 1. Top-Level Throttle to 50ms (~20 FPS) exactly like C#
     if (m_stopWatch.isValid() && m_stopWatch.elapsed() < 50) {
         return;
@@ -392,17 +504,33 @@ void CameraWorker::handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFram
 
     // 4. HIGH-SPEED ALGORITHM PROCESSING ENGINE (Equivalent to C# Task.Run)
     if (doProcess && !processingCopy.empty()) {
-        // Launch processing on a separate thread pool thread so the camera callback never blocks!
-        QtConcurrent::run([this, processingCopy]() {
-            cv::Mat frameToProcess = processingCopy;
-            this->processFrame(frameToProcess);
-        });
+        // Only one analysis job may run at once. Queuing a job for every camera
+        // frame can exhaust the thread pool and memory, eventually freezing the
+        // UI even though the camera is still delivering frames.
+        int expectedJobs = 0;
+        if (m_processingJobs.compare_exchange_strong(expectedJobs, 1)) {
+            QtConcurrent::run([this, processingCopy]() {
+                cv::Mat frameToProcess = processingCopy;
+                this->processFrame(frameToProcess);
+                m_processingJobs.store(0);
+            });
+        } else {
+            m_droppedProcessingFrames.fetch_add(1);
+        }
     }
 
     // 5. UNIFIED DISPLAY RENDERING PIPELINE (Equivalent to C# BeginInvoke)
-    QImage qimg = matToQImage(displayMat);
-    if (!qimg.isNull()) {
-        emit frameReady(qimg);
+    if (!m_uiFramePending.exchange(true)) {
+        // Keep at most one full-resolution image in Qt's queued connection.
+        // Without this backpressure the GUI event queue can grow indefinitely:
+        // the displayed image falls further behind, memory grows, and eventually
+        // the whole application appears frozen even while callbacks are running.
+        QImage qimg = matToQImage(displayMat);
+        if (!qimg.isNull()) {
+            emit frameReady(qimg);
+        } else {
+            m_uiFramePending.store(false);
+        }
     }
 }
 void CameraWorker::doCalibration(cv::Mat &src)
