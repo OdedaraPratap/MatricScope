@@ -150,11 +150,24 @@ void CameraWorker::run() {
     }
     qDebug() << "DEBUG: Hikrobot camera opened successfully.";
 
-    // 4. Set Trigger Mode to Off (Continuous Frame Grabbing)
+    // 4. Force monochrome acquisition before grabbing. Color cameras may default
+    // to a Bayer format, which is not part of the monochrome processing pipeline.
+    nRet = MV_CC_SetEnumValue(m_devHandle, "PixelFormat", PixelType_Gvsp_Mono8);
+    if (nRet != MV_OK) {
+        qDebug() << "DEBUG: Error - Camera does not support Mono8. Return:" << nRet;
+        emit statusUpdated("Error: Camera does not support Mono8 pixel format.");
+        MV_CC_CloseDevice(m_devHandle);
+        MV_CC_DestroyHandle(m_devHandle);
+        m_devHandle = nullptr;
+        return;
+    }
+    qDebug() << "DEBUG: PixelFormat set to Mono8.";
+
+    // 5. Set Trigger Mode to Off (Continuous Frame Grabbing)
     nRet = MV_CC_SetEnumValue(m_devHandle, "TriggerMode", 0);
     qDebug() << "DEBUG: Set TriggerMode to Off. Return:" << nRet;
 
-    // 5. Apply Initial Settings from QSettings
+    // 6. Apply Initial Settings from QSettings
     QSettings settings("MetricScope", "Settings");
     double initialExposure = settings.value("trackBarExposure1", 10000.0).toDouble();
     double initialGain = settings.value("trackBarGainMaster1", 10.0).toDouble();
@@ -166,7 +179,7 @@ void CameraWorker::run() {
     MV_CC_SetFloatValue(m_devHandle, "ExposureTime", initialExposure);
     MV_CC_SetFloatValue(m_devHandle, "Gain", initialGain);
 
-    // 6. Register Continuous Callback Hook
+    // 7. Register Continuous Callback Hook
     nRet = MV_CC_RegisterImageCallBackEx(m_devHandle, ImageCallBackEx, this);
     if (nRet != MV_OK) {
         qDebug() << "DEBUG: Error - Failed to register camera callback. Return:" << nRet;
@@ -175,7 +188,7 @@ void CameraWorker::run() {
         qDebug() << "DEBUG: Image callback registered successfully.";
     }
 
-    // 7. Start Grabbing Frames
+    // 8. Start Grabbing Frames
     nRet = MV_CC_StartGrabbing(m_devHandle);
     if (nRet != MV_OK) {
         qDebug() << "DEBUG: Error - Failed to start grabbing. Return:" << nRet;
@@ -326,26 +339,15 @@ void CameraWorker::handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFram
     }
     m_stopWatch.restart();
 
-    // 2. Convert Pixel Formats
-    cv::Mat matImage;
-    if (pFrameInfo->enPixelType == PixelType_Gvsp_Mono8) {
-        matImage = cv::Mat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC1, pData).clone();
-    }
-    else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerRG8 ||
-             pFrameInfo->enPixelType == PixelType_Gvsp_BayerGB8 ||
-             pFrameInfo->enPixelType == PixelType_Gvsp_BayerBG8) {
-        cv::Mat bayerMat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC1, pData);
-        int cvBayerCode = cv::COLOR_BayerRG2BGR;
-        if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerGB8) cvBayerCode = cv::COLOR_BayerGB2BGR;
-        else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerBG8) cvBayerCode = cv::COLOR_BayerBG2BGR;
-        cv::cvtColor(bayerMat, matImage, cvBayerCode);
-    }
-    else if (pFrameInfo->enPixelType == PixelType_Gvsp_RGB8_Packed) {
-        cv::Mat rgbMat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC3, pData);
-        cv::cvtColor(rgbMat, matImage, cv::COLOR_RGB2BGR);
-    } else {
+    // 2. The device is configured for Mono8 in run(), so reject any stale or
+    // unexpected color buffers rather than interpreting them with the wrong stride.
+    if (pFrameInfo->enPixelType != PixelType_Gvsp_Mono8) {
+        qDebug() << "DEBUG: Ignoring non-Mono8 frame. Pixel type:" << pFrameInfo->enPixelType;
         return;
     }
+
+    cv::Mat matImage(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC1, pData);
+    matImage = matImage.clone();
 
     if (matImage.empty()) return;
 
@@ -414,7 +416,11 @@ void CameraWorker::doCalibration(cv::Mat &src)
     if (physicalDiameter <= 0) return;
 
     cv::Mat gray, blur, thresh;
-    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    if (src.channels() == 3) {
+        cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    } else {
+        gray = src.clone();
+    }
     cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
 
     cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
