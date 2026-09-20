@@ -1227,132 +1227,12 @@ QString CameraWorker::measurePear(cv::Mat &src) {
 }
 
 QString CameraWorker::measureOval(cv::Mat &src) {
-    qDebug() << "DEBUG: [measureOval] Started.";
-    if (src.empty()) {
-        qDebug() << "DEBUG: [measureOval] src is empty!";
-        return "No Shape Found";
-    }
+    if (src.empty()) return "No Shape Found";
 
-    double ppm = getPpm();
+    const double ppm = getPpm();
     if (src.channels() == 1) {
         cv::cvtColor(src, src, cv::COLOR_GRAY2BGR);
-        qDebug() << "DEBUG: [measureOval] Converted 1-channel src to BGR.";
     }
-
-    cv::Mat gray, blur, diff, thresh;
-    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
-    cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
-
-    if (!m_backgroundGray.empty()) {
-        cv::absdiff(m_backgroundGray, blur, diff);
-        cv::threshold(diff, thresh, m_thresholdValue, 255, cv::THRESH_BINARY);
-        qDebug() << "DEBUG: [measureOval] Applied background subtraction threshold.";
-    } else {
-        cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
-        qDebug() << "DEBUG: [measureOval] Fallback to Otsu threshold.";
-    }
-
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
-    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
-    cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
-
-    std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
-    qDebug() << "DEBUG: [measureOval] findContours found:" << contours.size() << "contours.";
-
-    if (contours.empty()) return "No Shape Found";
-
-    std::vector<cv::Point> bestContour;
-    double maxArea = 0;
-
-    for (const auto& c : contours) {
-        double area = cv::contourArea(c);
-        cv::Rect rect = cv::boundingRect(c);
-
-        bool touchesBorder = (rect.x <= 2 || rect.y <= 2 ||
-                              rect.x + rect.width >= src.cols - 2 ||
-                              rect.y + rect.height >= src.rows - 2);
-
-        // Print details of larger contours to track if they are being rejected
-        if (area > 200) {
-             qDebug() << "DEBUG: [measureOval] Inspecting contour -> Area:" << area << "Touches Border:" << touchesBorder;
-        }
-
-        if (!touchesBorder && area > maxArea && area > 500) {
-            maxArea = area;
-            bestContour = c;
-        }
-    }
-
-    qDebug() << "DEBUG: [measureOval] maxArea after border filtering:" << maxArea;
-
-    if (bestContour.empty()) {
-        qDebug() << "DEBUG: [measureOval] bestContour is empty. Returning 'No Valid Object Found'.";
-        return "No Valid Object Found";
-    }
-
-    std::vector<cv::Point> hull;
-    cv::convexHull(bestContour, hull);
-
-    cv::Point lenStart(0, 0), lenEnd(0, 0);
-    double maxLenDist = 0;
-    for (size_t i = 0; i < hull.size(); i++) {
-        for (size_t j = i + 1; j < hull.size(); j++) {
-            double d = std::hypot(hull[i].x - hull[j].x, hull[i].y - hull[j].y);
-            if (d > maxLenDist) {
-                maxLenDist = d;
-                lenStart = hull[i];
-                lenEnd = hull[j];
-            }
-        }
-    }
-
-    double maxWidthDist = 0;
-    cv::Point widStart(0, 0), widEnd(0, 0);
-    double axisX = lenEnd.x - lenStart.x;
-    double axisY = lenEnd.y - lenStart.y;
-    double axisLength = std::hypot(axisX, axisY);
-
-    for (size_t i = 0; i < hull.size(); i++) {
-        for (size_t j = i + 1; j < hull.size(); j++) {
-            double sX = hull[j].x - hull[i].x;
-            double sY = hull[j].y - hull[i].y;
-            double crossProduct = std::abs(sX * axisY - sY * axisX) / (axisLength == 0 ? 1 : axisLength);
-
-            if (crossProduct > maxWidthDist) {
-                maxWidthDist = crossProduct;
-                widStart = hull[i];
-                widEnd = hull[j];
-            }
-        }
-    }
-
-    double lengthMM = applyVariation(maxLenDist / ppm, true);
-    double widthMM = applyVariation(maxWidthDist / ppm, false);
-    double ratio = (widthMM == 0) ? 0 : lengthMM / widthMM;
-    cv::Point center((lenStart.x + lenEnd.x) / 2, (lenStart.y + lenEnd.y) / 2);
-
-    qDebug() << "DEBUG: [measureOval] Drawing lines... L:" << lengthMM << "W:" << widthMM;
-
-    cv::line(src, lenStart, lenEnd, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
-    cv::line(src, widStart, widEnd, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
-    cv::circle(src, center, 5, cv::Scalar(0, 165, 255), -1, cv::LINE_AA);
-
-    std::vector<std::vector<cv::Point>> hullWrapper = { hull };
-    cv::polylines(src, hullWrapper, true, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-
-    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), cv::Point(center.x + 25, center.y - 20), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
-    cv::putText(src, QString("W: %1mm").arg(widthMM, 0, 'f', 2).toStdString(), cv::Point(widStart.x + 15, widStart.y + 25), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
-
-    cv::imwrite("ovel_Result.png", src);
-    qDebug() << "DEBUG: [measureOval] Finished writing ovel_Result.png and returning string.";
-
-    return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
-}
-
-/*QString CameraWorker::measureOval(cv::Mat &src) {
-    if (src.empty()) return "No Shape Found";
-    double ppm = getPpm();
 
     cv::Mat gray, blur, thresh;
     cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
@@ -1366,52 +1246,73 @@ QString CameraWorker::measureOval(cv::Mat &src) {
     cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
     if (contours.empty()) return "No Shape Found";
 
-    auto largestContour = *std::max_element(contours.begin(), contours.end(),
-        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
+    const auto largest = std::max_element(contours.begin(), contours.end(),
+        [](const std::vector<cv::Point> &a, const std::vector<cv::Point> &b) {
+            return cv::contourArea(a) < cv::contourArea(b);
+        });
 
     std::vector<cv::Point> hull;
-    cv::convexHull(largestContour, hull);
+    cv::convexHull(*largest, hull);
 
-    cv::RotatedRect minRect = cv::minAreaRect(hull);
-    double lengthMM = applyVariation(std::max(minRect.size.width, minRect.size.height) / ppm, true);
-    double widthMM = applyVariation(std::min(minRect.size.width, minRect.size.height) / ppm, false);
-    double ratio = (widthMM == 0) ? 0 : lengthMM / widthMM;
+    const cv::RotatedRect minRect = cv::minAreaRect(hull);
+    const double lengthPx = std::max(minRect.size.width, minRect.size.height);
+    const double widthPx = std::min(minRect.size.width, minRect.size.height);
 
-    cv::Point2f rectPoints[4];
-    minRect.points(rectPoints);
-    cv::Point pt01((rectPoints[0].x + rectPoints[1].x) / 2, (rectPoints[0].y + rectPoints[1].y) / 2);
-    cv::Point pt12((rectPoints[1].x + rectPoints[2].x) / 2, (rectPoints[1].y + rectPoints[2].y) / 2);
-    cv::Point pt23((rectPoints[2].x + rectPoints[3].x) / 2, (rectPoints[2].y + rectPoints[3].y) / 2);
-    cv::Point pt30((rectPoints[3].x + rectPoints[0].x) / 2, (rectPoints[3].y + rectPoints[0].y) / 2);
+    double lengthMM = applyVariation(lengthPx / ppm, true);
+    double widthMM = applyVariation(widthPx / ppm, false);
+    const double ratio = (widthMM == 0.0) ? 0.0 : lengthMM / widthMM;
+
+    cv::Point2f corners[4];
+    minRect.points(corners);
+    const cv::Point pt01(cvRound((corners[0].x + corners[1].x) / 2.0f),
+                         cvRound((corners[0].y + corners[1].y) / 2.0f));
+    const cv::Point pt12(cvRound((corners[1].x + corners[2].x) / 2.0f),
+                         cvRound((corners[1].y + corners[2].y) / 2.0f));
+    const cv::Point pt23(cvRound((corners[2].x + corners[3].x) / 2.0f),
+                         cvRound((corners[2].y + corners[3].y) / 2.0f));
+    const cv::Point pt30(cvRound((corners[3].x + corners[0].x) / 2.0f),
+                         cvRound((corners[3].y + corners[0].y) / 2.0f));
 
     cv::Point lenStart, lenEnd, widStart, widEnd;
-    if (std::hypot(pt01.x - pt23.x, pt01.y - pt23.y) > std::hypot(pt12.x - pt30.x, pt12.y - pt30.y)) {
-        lenStart = pt01; lenEnd = pt23; widStart = pt12; widEnd = pt30;
+    if (cv::norm(pt01 - pt23) > cv::norm(pt12 - pt30)) {
+        lenStart = pt01;
+        lenEnd = pt23;
+        widStart = pt12;
+        widEnd = pt30;
     } else {
-        lenStart = pt12; lenEnd = pt30; widStart = pt01; widEnd = pt23;
+        lenStart = pt12;
+        lenEnd = pt30;
+        widStart = pt01;
+        widEnd = pt23;
     }
+
+    const cv::Point center(cvRound(minRect.center.x), cvRound(minRect.center.y));
 
     cv::line(src, lenStart, lenEnd, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
     cv::line(src, widStart, widEnd, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
-    cv::circle(src, minRect.center, 5, cv::Scalar(0, 165, 255), -1, cv::LINE_AA);
+    cv::circle(src, center, 5, cv::Scalar(0, 165, 255), -1, cv::LINE_AA);
+
     std::vector<std::vector<cv::Point>> hullWrapper = { hull };
     cv::polylines(src, hullWrapper, true, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
 
-    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), cv::Point(minRect.center.x + 25, minRect.center.y - 20), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), cv::Point(center.x + 25, center.y - 20), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
     cv::putText(src, QString("W: %1mm").arg(widthMM, 0, 'f', 2).toStdString(), cv::Point(widStart.x + 15, widStart.y + 25), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
 
     cv::Mat printCanvas(src.size(), CV_8UC3, cv::Scalar(255, 255, 255));
     cv::polylines(printCanvas, hullWrapper, true, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
-    cv::Rect cropRect = cv::boundingRect(hull);
-    cropRect.x = std::max(0, cropRect.x - 15); cropRect.y = std::max(0, cropRect.y - 15);
-    cropRect.width = std::min(printCanvas.cols - cropRect.x, cropRect.width + 30);
-    cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
+    const cv::Rect bounds = cv::boundingRect(hull);
+    const int padding = 15;
+    const int left = std::max(0, bounds.x - padding);
+    const int top = std::max(0, bounds.y - padding);
+    const int right = std::min(printCanvas.cols, bounds.x + bounds.width + padding);
+    const int bottom = std::min(printCanvas.rows, bounds.y + bounds.height + padding);
+    const cv::Rect cropRect(left, top, right - left, bottom - top);
     cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
 
     cv::imwrite("ovel_Result.png", src);
+
     return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
 }
-*/
 
 // ============================================================================
 // POLYGON & CUSTOM SHAPE MATH HELPERS
