@@ -150,11 +150,24 @@ void CameraWorker::run() {
     }
     qDebug() << "DEBUG: Hikrobot camera opened successfully.";
 
-    // 4. Set Trigger Mode to Off (Continuous Frame Grabbing)
+    // 4. Force monochrome acquisition before grabbing. Color cameras may default
+    // to a Bayer format, which is not part of the monochrome processing pipeline.
+    nRet = MV_CC_SetEnumValue(m_devHandle, "PixelFormat", PixelType_Gvsp_Mono8);
+    if (nRet != MV_OK) {
+        qDebug() << "DEBUG: Error - Camera does not support Mono8. Return:" << nRet;
+        emit statusUpdated("Error: Camera does not support Mono8 pixel format.");
+        MV_CC_CloseDevice(m_devHandle);
+        MV_CC_DestroyHandle(m_devHandle);
+        m_devHandle = nullptr;
+        return;
+    }
+    qDebug() << "DEBUG: PixelFormat set to Mono8.";
+
+    // 5. Set Trigger Mode to Off (Continuous Frame Grabbing)
     nRet = MV_CC_SetEnumValue(m_devHandle, "TriggerMode", 0);
     qDebug() << "DEBUG: Set TriggerMode to Off. Return:" << nRet;
 
-    // 5. Apply Initial Settings from QSettings
+    // 6. Apply Initial Settings from QSettings
     QSettings settings("MetricScope", "Settings");
     double initialExposure = settings.value("trackBarExposure1", 10000.0).toDouble();
     double initialGain = settings.value("trackBarGainMaster1", 10.0).toDouble();
@@ -166,7 +179,7 @@ void CameraWorker::run() {
     MV_CC_SetFloatValue(m_devHandle, "ExposureTime", initialExposure);
     MV_CC_SetFloatValue(m_devHandle, "Gain", initialGain);
 
-    // 6. Register Continuous Callback Hook
+    // 7. Register Continuous Callback Hook
     nRet = MV_CC_RegisterImageCallBackEx(m_devHandle, ImageCallBackEx, this);
     if (nRet != MV_OK) {
         qDebug() << "DEBUG: Error - Failed to register camera callback. Return:" << nRet;
@@ -175,7 +188,7 @@ void CameraWorker::run() {
         qDebug() << "DEBUG: Image callback registered successfully.";
     }
 
-    // 7. Start Grabbing Frames
+    // 8. Start Grabbing Frames
     nRet = MV_CC_StartGrabbing(m_devHandle);
     if (nRet != MV_OK) {
         qDebug() << "DEBUG: Error - Failed to start grabbing. Return:" << nRet;
@@ -320,86 +333,95 @@ void __stdcall CameraWorker::ImageCallBackEx(unsigned char *pData, MV_FRAME_OUT_
 void CameraWorker::handleFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pFrameInfo) {
     if (!pData || !pFrameInfo) return;
 
-    // 1. Top-Level Throttle to 50ms (~20 FPS) exactly like C#
+    // Prevent overlapping processFrame() jobs without adding any header variables.
+    static bool processingBusy = false;
+
+    // Top-level throttle to about 20 FPS.
     if (m_stopWatch.isValid() && m_stopWatch.elapsed() < 50) {
         return;
     }
     m_stopWatch.restart();
 
-    // 2. Convert Pixel Formats
-    cv::Mat matImage;
-    if (pFrameInfo->enPixelType == PixelType_Gvsp_Mono8) {
-        matImage = cv::Mat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC1, pData).clone();
-    }
-    else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerRG8 ||
-             pFrameInfo->enPixelType == PixelType_Gvsp_BayerGB8 ||
-             pFrameInfo->enPixelType == PixelType_Gvsp_BayerBG8) {
-        cv::Mat bayerMat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC1, pData);
-        int cvBayerCode = cv::COLOR_BayerRG2BGR;
-        if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerGB8) cvBayerCode = cv::COLOR_BayerGB2BGR;
-        else if (pFrameInfo->enPixelType == PixelType_Gvsp_BayerBG8) cvBayerCode = cv::COLOR_BayerBG2BGR;
-        cv::cvtColor(bayerMat, matImage, cvBayerCode);
-    }
-    else if (pFrameInfo->enPixelType == PixelType_Gvsp_RGB8_Packed) {
-        cv::Mat rgbMat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC3, pData);
-        cv::cvtColor(rgbMat, matImage, cv::COLOR_RGB2BGR);
-    } else {
+    // Camera is configured for Mono8 in run().
+    if (pFrameInfo->enPixelType != PixelType_Gvsp_Mono8) {
+        qDebug() << "DEBUG: Ignoring non-Mono8 frame. Pixel type:" << pFrameInfo->enPixelType;
         return;
     }
+
+    cv::Mat matImage(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC1, pData);
+    matImage = matImage.clone();
 
     if (matImage.empty()) return;
 
     cv::Mat processingCopy;
     cv::Mat displayMat;
     bool doProcess = false;
+    bool launchProcessing = false;
 
-    // 3. Safely Lock, Copy, and Handle Background/Calibration (Equivalent to C# lock(frameLock))
     {
         QMutexLocker locker(&m_mutex);
+
+        // Always keep the newest LIVE camera frame.
         m_latestFrame = matImage.clone();
 
+        // Background capture.
         if (m_captureFlag) {
             cv::imwrite("Blank_Bg.png", m_latestFrame);
+
             cv::Mat gray, blurBg;
-            if (m_latestFrame.channels() == 3) cv::cvtColor(m_latestFrame, gray, cv::COLOR_BGR2GRAY);
-            else gray = m_latestFrame.clone();
+            if (m_latestFrame.channels() == 3)
+                cv::cvtColor(m_latestFrame, gray, cv::COLOR_BGR2GRAY);
+            else
+                gray = m_latestFrame.clone();
 
             cv::medianBlur(gray, blurBg, 7);
-            m_backgroundGray = blurBg;
+            m_backgroundGray = blurBg.clone();
             m_captureFlag = false;
             emit statusUpdated("Background Captured!");
         }
 
+        // Calibration request.
         if (m_calibrationFlag) {
             cv::Mat calibCopy = m_latestFrame.clone();
             doCalibration(calibCopy);
             m_calibrationFlag = false;
         }
 
-        // Prepare the async processing copy
+        // Prepare one frame for object tracking / auto measurement.
         if (!m_backgroundGray.empty() && m_mode != MeasurementMode::None) {
             processingCopy = m_latestFrame.clone();
             doProcess = true;
         }
 
-        // Determine what to show on the UI (Snapshot vs Live)
+        // Display frozen measured frame only while snapshot is valid.
         if (m_isRenderingSnapshot && !m_lastProcessedFrame.empty()) {
             displayMat = m_lastProcessedFrame.clone();
         } else {
             displayMat = m_latestFrame.clone();
         }
+
+        // Only one processFrame() job at a time.
+        if (doProcess && !processingCopy.empty() && !processingBusy) {
+            processingBusy = true;
+            launchProcessing = true;
+        }
     }
 
-    // 4. HIGH-SPEED ALGORITHM PROCESSING ENGINE (Equivalent to C# Task.Run)
-    if (doProcess && !processingCopy.empty()) {
-        // Launch processing on a separate thread pool thread so the camera callback never blocks!
+    if (launchProcessing) {
         QtConcurrent::run([this, processingCopy]() {
-            cv::Mat frameToProcess = processingCopy;
-            this->processFrame(frameToProcess);
+            try {
+                cv::Mat frameToProcess = processingCopy.clone();
+                this->processFrame(frameToProcess);
+            }
+            catch (...) {
+                qDebug() << "DEBUG: Exception inside processFrame().";
+            }
+
+            QMutexLocker locker(&m_mutex);
+            processingBusy = false;
         });
     }
 
-    // 5. UNIFIED DISPLAY RENDERING PIPELINE (Equivalent to C# BeginInvoke)
     QImage qimg = matToQImage(displayMat);
     if (!qimg.isNull()) {
         emit frameReady(qimg);
@@ -414,7 +436,11 @@ void CameraWorker::doCalibration(cv::Mat &src)
     if (physicalDiameter <= 0) return;
 
     cv::Mat gray, blur, thresh;
-    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    if (src.channels() == 3) {
+        cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    } else {
+        gray = src.clone();
+    }
     cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
 
     cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
@@ -531,9 +557,16 @@ QImage CameraWorker::matToQImage(const cv::Mat &mat) {
 
 void CameraWorker::triggerAutoMeasurement(cv::Mat &frame) {
     qDebug() << "DEBUG: [triggerAutoMeasurement] Started. Mode =" << static_cast<int>(m_mode);
+
+    MeasurementMode modeAtMeasurementStart;
+    {
+        QMutexLocker locker(&m_mutex);
+        modeAtMeasurementStart = m_mode;
+    }
+
     QString cvDisplayString = "";
 
-    switch (m_mode) {
+    switch (modeAtMeasurementStart) {
         case MeasurementMode::Round:    cvDisplayString = measureRound(frame); break;
         case MeasurementMode::Pear:     cvDisplayString = measurePear(frame); break;
         case MeasurementMode::Oval:     cvDisplayString = measureOval(frame); break;
@@ -550,9 +583,7 @@ void CameraWorker::triggerAutoMeasurement(cv::Mat &frame) {
 
     qDebug() << "DEBUG: [triggerAutoMeasurement] Result string from measure function:\n" << cvDisplayString;
 
-    if (!cvDisplayString.isEmpty()) emit statusUpdated(cvDisplayString);
-
-    // Check for failure keywords
+    // Reject only real measurement failures.
     if (cvDisplayString.isEmpty() ||
         cvDisplayString.contains("Error") ||
         cvDisplayString.contains("Please Calibrate") ||
@@ -560,51 +591,88 @@ void CameraWorker::triggerAutoMeasurement(cv::Mat &frame) {
         cvDisplayString.contains("No Shape") ||
         cvDisplayString.contains("No Valid"))
     {
-        qDebug() << "DEBUG: [triggerAutoMeasurement] Measurement failed or rejected. Aborting snapshot rendering.";
+        qDebug() << "DEBUG: [triggerAutoMeasurement] Measurement failed or rejected.";
+
+        QMutexLocker locker(&m_mutex);
+        m_hasMeasuredCurrentObject = false;
+        m_isRenderingSnapshot = false;
+        m_stableFrameCount = 0;
         return;
     }
 
-    qDebug() << "DEBUG: [triggerAutoMeasurement] Measurement valid. Parsing dimensions.";
-    double extractedLength = 0.0, extractedWidth = 0.0;
+    // If the user changed measurement mode while this measurement was running,
+    // do not display the old mode's result.
+    {
+        QMutexLocker locker(&m_mutex);
+        if (m_mode != modeAtMeasurementStart) {
+            m_hasMeasuredCurrentObject = false;
+            m_isRenderingSnapshot = false;
+            m_stableFrameCount = 0;
+            qDebug() << "DEBUG: [triggerAutoMeasurement] Mode changed while measuring. Ignoring old result.";
+            return;
+        }
+    }
 
-    if (m_mode == MeasurementMode::Round) {
+    if (!cvDisplayString.isEmpty())
+        emit statusUpdated(cvDisplayString);
+
+    qDebug() << "DEBUG: [triggerAutoMeasurement] Measurement valid. Parsing dimensions.";
+
+    double extractedLength = 0.0;
+    double extractedWidth = 0.0;
+
+    if (modeAtMeasurementStart == MeasurementMode::Round) {
         QStringList parts = cvDisplayString.split(" ", QString::SkipEmptyParts);
-        if (parts.size() >= 3) extractedLength = parts[2].toDouble();
+        if (parts.size() >= 3)
+            extractedLength = parts[2].toDouble();
     }
     else if (cvDisplayString.contains("Side")) {
         QRegularExpression regex("Side\\s+\\d+:\\s+([0-9]+(?:\\.[0-9]+)?)");
         QRegularExpressionMatchIterator i = regex.globalMatch(cvDisplayString);
-        double maxSide = 0.0, minSide = 999999.0;
+
+        double maxSide = 0.0;
+        double minSide = 999999.0;
+
         while (i.hasNext()) {
             double val = i.next().captured(1).toDouble();
             if (val > maxSide) maxSide = val;
             if (val < minSide) minSide = val;
         }
+
         extractedLength = maxSide;
         extractedWidth = (minSide == 999999.0) ? 0.0 : minSide;
     }
     else {
         QRegularExpression regex("[0-9]+(?:\\.[0-9]+)?");
         QRegularExpressionMatchIterator i = regex.globalMatch(cvDisplayString);
+
         if (i.hasNext()) extractedLength = i.next().captured(0).toDouble();
         if (i.hasNext()) extractedWidth = i.next().captured(0).toDouble();
     }
 
-    qDebug() << "DEBUG: [triggerAutoMeasurement] Extracted L:" << extractedLength << " W:" << extractedWidth;
+    qDebug() << "DEBUG: [triggerAutoMeasurement] Extracted L:" << extractedLength
+             << " W:" << extractedWidth;
+
     emit measurementResult(cvDisplayString, extractedLength, extractedWidth);
 
-    // SAVE FROZEN OVERLAY SNAPSHOT
+    // Save the measured/annotated frame and keep displaying it until
+    // processFrame() detects removal, movement, hand/occlusion, or mode change.
     {
         QMutexLocker locker(&m_mutex);
-        if (m_lastProcessedFrame.empty()) {
-            m_lastProcessedFrame = cv::Mat();
+
+        if (m_mode != modeAtMeasurementStart) {
+            m_hasMeasuredCurrentObject = false;
+            m_isRenderingSnapshot = false;
+            m_stableFrameCount = 0;
+            return;
         }
+
         frame.clone().copyTo(m_lastProcessedFrame);
         m_isRenderingSnapshot = true;
-        qDebug() << "DEBUG: [triggerAutoMeasurement] Saved frozen snapshot and activated m_isRenderingSnapshot = true.";
+
+        qDebug() << "DEBUG: [triggerAutoMeasurement] Frozen measurement snapshot activated.";
     }
 
-    // ... (Keep the rest of your SQLite / GPIO logic down here exactly as it is) ...
     qDebug() << "DEBUG: [triggerAutoMeasurement] Finished processing database/GPIO.";
 }
 
@@ -618,12 +686,13 @@ void CameraWorker::processFrame(cv::Mat &frame) {
         liveGray = frame.clone();
     }
 
-    //cv::medianBlur(liveGray, liveGray, 7);
-
     cv::Mat bgCopy;
+    MeasurementMode modeAtStart;
+
     {
         QMutexLocker locker(&m_mutex);
         bgCopy = m_backgroundGray.clone();
+        modeAtStart = m_mode;
     }
 
     if (bgCopy.empty()) return;
@@ -631,68 +700,165 @@ void CameraWorker::processFrame(cv::Mat &frame) {
     cv::absdiff(bgCopy, liveGray, diff);
     cv::threshold(diff, thresh, m_thresholdValue, 255, cv::THRESH_BINARY);
 
-    if (cv::countNonZero(thresh) > 1250) {
-        std::vector<std::vector<cv::Point>> contours;
-        cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    int foregroundPixels = cv::countNonZero(thresh);
 
-        if (!contours.empty()) {
-            int bestIdx = -1;
-            double maxArea = 0;
+    // Object removed: clear old frozen measurement and return to live camera.
+    if (foregroundPixels <= 1250) {
+        resetSnapshotState();
+        return;
+    }
 
-            for (size_t i = 0; i < contours.size(); ++i) {
-                double area = cv::contourArea(contours[i]);
-                cv::Rect rect = cv::boundingRect(contours[i]);
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
-                // Ignore Hikrobot edge artifacts
-                bool touchesBorder = (rect.x <= 2 || rect.y <= 2 ||
-                                      rect.x + rect.width >= frame.cols - 2 ||
-                                      rect.y + rect.height >= frame.rows - 2);
+    if (contours.empty()) {
+        QMutexLocker locker(&m_mutex);
+        m_isRenderingSnapshot = false;
+        m_hasMeasuredCurrentObject = false;
+        m_stableFrameCount = 0;
+        m_lastCentroid = cv::Point(0, 0);
+        return;
+    }
 
-                if (!touchesBorder && area > maxArea) {
-                    maxArea = area;
-                    bestIdx = static_cast<int>(i);
-                }
+    int bestIdx = -1;
+    double maxArea = 0.0;
+    bool largeBorderObject = false;
+
+    // A hand normally enters from an image edge. Use a conservative dynamic
+    // threshold so tiny Hikrobot edge artifacts do not cancel a valid snapshot.
+    double largeBorderAreaThreshold = std::max(
+        5000.0,
+        static_cast<double>(frame.rows * frame.cols) * 0.005);
+
+    for (size_t i = 0; i < contours.size(); ++i) {
+        double area = cv::contourArea(contours[i]);
+        cv::Rect rect = cv::boundingRect(contours[i]);
+
+        bool touchesBorder =
+            (rect.x <= 2 ||
+             rect.y <= 2 ||
+             rect.x + rect.width >= frame.cols - 2 ||
+             rect.y + rect.height >= frame.rows - 2);
+
+        if (touchesBorder) {
+            if (area > largeBorderAreaThreshold) {
+                largeBorderObject = true;
             }
+            continue;
+        }
 
-            if (bestIdx != -1) {
-                cv::Rect boundingBox = cv::boundingRect(contours[bestIdx]);
-                double aspect = static_cast<double>(boundingBox.width) / boundingBox.height;
+        if (area > maxArea) {
+            maxArea = area;
+            bestIdx = static_cast<int>(i);
+        }
+    }
 
-                if (aspect > 0.22 && aspect < 4.5 && maxArea > 800) {
-                    cv::Moments mu = cv::moments(contours[bestIdx], true);
-                    if (mu.m00 > 0) {
-                        cv::Point currentCentroid(mu.m10 / mu.m00, mu.m01 / mu.m00);
-
-                        QMutexLocker locker(&m_mutex); // Lock tracking variables
-                        double dist = std::hypot(currentCentroid.x - m_lastCentroid.x, currentCentroid.y - m_lastCentroid.y);
-
-                        if (dist > MOVEMENT_THRESHOLD) {
-                            m_stableFrameCount = 0;
-                            m_hasMeasuredCurrentObject = false;
-                            m_isRenderingSnapshot = false; // Reset snapshot instantly
-                            emit statusUpdated("Object moving...");
-                        } else {
-                            if (!m_hasMeasuredCurrentObject) {
-                                m_stableFrameCount++;
-                                if (m_stableFrameCount >= FRAMES_TO_STABILIZE) {
-                                    m_hasMeasuredCurrentObject = true;
-
-                                    cv::Mat isolatedFrame = frame.clone();
-
-                                    // Unlock before jumping into the heavy drawing function
-                                    locker.unlock();
-                                    triggerAutoMeasurement(isolatedFrame);
-                                    locker.relock();
-                                }
-                            }
-                        }
-                        m_lastCentroid = currentCentroid;
-                    }
-                }
+    // If a large object enters from the border while a measurement is frozen,
+    // it is most likely a hand/occlusion. Immediately return to live view.
+    if (largeBorderObject) {
+        bool hadSnapshot = false;
+        {
+            QMutexLocker locker(&m_mutex);
+            hadSnapshot = m_isRenderingSnapshot || m_hasMeasuredCurrentObject;
+            if (hadSnapshot) {
+                m_isRenderingSnapshot = false;
+                m_hasMeasuredCurrentObject = false;
+                m_stableFrameCount = 0;
+                m_lastCentroid = cv::Point(0, 0);
             }
         }
-    } else {
-        resetSnapshotState();
+
+        if (hadSnapshot) {
+            emit statusUpdated("Scene changed - waiting for object to stabilize...");
+            return;
+        }
+    }
+
+    // Foreground exists but it is not a valid measurable object.
+    // Never keep an old measurement visible in that situation.
+    if (bestIdx == -1) {
+        QMutexLocker locker(&m_mutex);
+        m_isRenderingSnapshot = false;
+        m_hasMeasuredCurrentObject = false;
+        m_stableFrameCount = 0;
+        m_lastCentroid = cv::Point(0, 0);
+        return;
+    }
+
+    cv::Rect boundingBox = cv::boundingRect(contours[bestIdx]);
+
+    if (boundingBox.height <= 0) {
+        QMutexLocker locker(&m_mutex);
+        m_isRenderingSnapshot = false;
+        m_hasMeasuredCurrentObject = false;
+        m_stableFrameCount = 0;
+        m_lastCentroid = cv::Point(0, 0);
+        return;
+    }
+
+    double aspect = static_cast<double>(boundingBox.width) /
+                    static_cast<double>(boundingBox.height);
+
+    if (!(aspect > 0.22 && aspect < 4.5 && maxArea > 800)) {
+        QMutexLocker locker(&m_mutex);
+        m_isRenderingSnapshot = false;
+        m_hasMeasuredCurrentObject = false;
+        m_stableFrameCount = 0;
+        m_lastCentroid = cv::Point(0, 0);
+        return;
+    }
+
+    cv::Moments mu = cv::moments(contours[bestIdx], true);
+
+    if (mu.m00 <= 0) {
+        QMutexLocker locker(&m_mutex);
+        m_isRenderingSnapshot = false;
+        m_hasMeasuredCurrentObject = false;
+        m_stableFrameCount = 0;
+        m_lastCentroid = cv::Point(0, 0);
+        return;
+    }
+
+    cv::Point currentCentroid(
+        static_cast<int>(mu.m10 / mu.m00),
+        static_cast<int>(mu.m01 / mu.m00));
+
+    cv::Mat isolatedFrame;
+    bool shouldMeasure = false;
+
+    {
+        QMutexLocker locker(&m_mutex);
+
+        // Drop an old queued frame if the user changed measurement mode.
+        if (m_mode != modeAtStart) {
+            return;
+        }
+
+        double dist = std::hypot(
+            currentCentroid.x - m_lastCentroid.x,
+            currentCentroid.y - m_lastCentroid.y);
+
+        if (dist > MOVEMENT_THRESHOLD) {
+            m_stableFrameCount = 0;
+            m_hasMeasuredCurrentObject = false;
+            m_isRenderingSnapshot = false;
+            emit statusUpdated("Object moving...");
+        }
+        else if (!m_hasMeasuredCurrentObject) {
+            m_stableFrameCount++;
+
+            if (m_stableFrameCount >= FRAMES_TO_STABILIZE) {
+                m_hasMeasuredCurrentObject = true;
+                isolatedFrame = frame.clone();
+                shouldMeasure = true;
+            }
+        }
+
+        m_lastCentroid = currentCentroid;
+    }
+
+    if (shouldMeasure && !isolatedFrame.empty()) {
+        triggerAutoMeasurement(isolatedFrame);
     }
 }
 /*void CameraWorker::triggerAutoMeasurement(cv::Mat &frame) {
@@ -891,76 +1057,286 @@ void CameraWorker::triggerPiGpioOutput(int boxNumber) {
 // SHAPE LOGIC
 // ============================================================================
 
-QString CameraWorker::measureGeneral(cv::Mat &src) {
-    if (src.empty()) return "No Image Data";
+QString CameraWorker::measureGeneral(cv::Mat &src)
+{
+    if (src.empty())
+        return "No Image Data";
+
     double ppm = getPpm();
-    if (src.channels() == 1) {
-            cv::cvtColor(src, src, cv::COLOR_GRAY2BGR);
+
+    if (ppm <= 0.0)
+        ppm = 1.0;
+
+    // ==========================================================
+    // ENSURE BGR
+    // ==========================================================
+    if (src.channels() == 1)
+    {
+        cv::cvtColor(
+            src,
+            src,
+            cv::COLOR_GRAY2BGR
+        );
     }
-    cv::Mat gray, blur, thresh;
-    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
-    cv::GaussianBlur(gray, blur, cv::Size(3, 3), 0);
-    cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
 
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
-    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
-    cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+    // ==========================================================
+    // PREPROCESS
+    // ==========================================================
+    cv::Mat gray;
+    cv::Mat blur;
+    cv::Mat thresh;
 
+    cv::cvtColor(
+        src,
+        gray,
+        cv::COLOR_BGR2GRAY
+    );
+
+    cv::GaussianBlur(
+        gray,
+        blur,
+        cv::Size(3, 3),
+        0
+    );
+
+    cv::threshold(
+        blur,
+        thresh,
+        0,
+        255,
+        cv::THRESH_BINARY_INV |
+        cv::THRESH_OTSU
+    );
+
+    // ==========================================================
+    // MORPHOLOGY
+    //
+    // IMPORTANT:
+    // CLOSE only.
+    // MORPH_OPEN can remove outside edge pixels.
+    // ==========================================================
+    cv::Mat kernel =
+        cv::getStructuringElement(
+            cv::MORPH_ELLIPSE,
+            cv::Size(3, 3)
+        );
+
+    cv::morphologyEx(
+        thresh,
+        thresh,
+        cv::MORPH_CLOSE,
+        kernel
+    );
+
+    // ==========================================================
+    // FIND CONTOURS
+    //
+    // CHAIN_APPROX_NONE keeps every contour point.
+    // ==========================================================
     std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
-    if (contours.empty()) return "No Shape Found";
+    cv::findContours(
+        thresh,
+        contours,
+        cv::RETR_EXTERNAL,
+        cv::CHAIN_APPROX_NONE
+    );
 
-    auto largestContour = *std::max_element(contours.begin(), contours.end(),
-        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
+    if (contours.empty())
+        return "No Shape Found";
 
-    if (cv::contourArea(largestContour) < 800) return "No Object Detected (Noise Ignored)";
+    // ==========================================================
+    // LARGEST CONTOUR
+    // ==========================================================
+    auto largestContour =
+        *std::max_element(
+            contours.begin(),
+            contours.end(),
+            [](const std::vector<cv::Point>& a,
+               const std::vector<cv::Point>& b)
+            {
+                return cv::contourArea(a)
+                     < cv::contourArea(b);
+            }
+        );
 
+    if (cv::contourArea(largestContour) < 800)
+        return "No Object Detected (Noise Ignored)";
+
+    // ==========================================================
+    // CONVEX HULL
+    //
+    // This represents the OUTSIDE boundary.
+    // Do NOT approxPolyDP before measurement.
+    // ==========================================================
     std::vector<cv::Point> hull;
-    cv::convexHull(largestContour, hull);
 
-    std::vector<cv::Point> smoothContour;
-    double epsilon = 0.01 * cv::arcLength(hull, true);
-    cv::approxPolyDP(hull, smoothContour, epsilon, true);
+    cv::convexHull(
+        largestContour,
+        hull
+    );
 
-    cv::RotatedRect minRect = cv::minAreaRect(smoothContour);
+    if (hull.empty())
+        return "No Shape Found";
 
-    double boxLengthPx = std::max(minRect.size.width, minRect.size.height);
-    double boxWidthPx = std::min(minRect.size.width, minRect.size.height);
+    // ==========================================================
+    // MINIMUM ROTATED RECTANGLE
+    //
+    // IMPORTANT:
+    // Use full HULL directly.
+    // ==========================================================
+    cv::RotatedRect minRect =
+        cv::minAreaRect(hull);
 
-    double boxLengthMM = applyVariation(boxLengthPx / ppm, true);
-    double boxWidthMM = applyVariation(boxWidthPx / ppm, false);
-    double ratio = (boxWidthMM == 0) ? 0 : boxLengthMM / boxWidthMM;
+    // ==========================================================
+    // LENGTH / WIDTH IN PIXELS
+    // ==========================================================
+    double boxLengthPx =
+        std::max(
+            static_cast<double>(minRect.size.width),
+            static_cast<double>(minRect.size.height)
+        );
 
-    cv::Point2f rectPoints[4];
-    minRect.points(rectPoints);
+    double boxWidthPx =
+        std::min(
+            static_cast<double>(minRect.size.width),
+            static_cast<double>(minRect.size.height)
+        );
+
+    // ==========================================================
+    // PIXEL -> MM
+    // ==========================================================
+    double rawLengthMM =
+        boxLengthPx / ppm;
+
+    double rawWidthMM =
+        boxWidthPx / ppm;
+
+    double ratio =
+        (rawWidthMM == 0.0)
+        ? 0.0
+        : rawLengthMM / rawWidthMM;
+
+    // Apply your correction only after raw measurement
+    double boxLengthMM =
+        applyVariation(
+            rawLengthMM,
+            true
+        );
+
+    double boxWidthMM =
+        applyVariation(
+            rawWidthMM,
+            false
+        );
+
+    // ==========================================================
+    // ROTATED RECTANGLE POINTS
+    // ==========================================================
+    cv::Point2f rectPointsF[4];
+
+    minRect.points(rectPointsF);
+
     std::vector<cv::Point> boxPoints(4);
-    for (int i = 0; i < 4; i++) boxPoints[i] = cv::Point(std::round(rectPoints[i].x), std::round(rectPoints[i].y));
 
-    std::vector<std::vector<cv::Point>> boxWrapper = { boxPoints };
-    std::vector<std::vector<cv::Point>> smoothWrapper = { smoothContour };
+    for (int i = 0; i < 4; i++)
+    {
+        boxPoints[i] =
+            cv::Point(
+                static_cast<int>(
+                    std::round(rectPointsF[i].x)
+                ),
+                static_cast<int>(
+                    std::round(rectPointsF[i].y)
+                )
+            );
+    }
 
-    cv::polylines(src, boxWrapper, true, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
-    cv::polylines(src, smoothWrapper, true, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-    cv::circle(src, minRect.center, 4, cv::Scalar(255, 255, 255), -1, cv::LINE_AA);
+    std::vector<std::vector<cv::Point>>
+        boxWrapper =
+        {
+            boxPoints
+        };
 
-    QString text = QString("Box L: %1mm | W: %2mm").arg(boxLengthMM, 0, 'f', 2).arg(boxWidthMM, 0, 'f', 2);
-    cv::putText(src, text.toStdString(), cv::Point(15, 35), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
+    std::vector<std::vector<cv::Point>>
+        hullWrapper =
+        {
+            hull
+        };
 
-    //cv::Mat printCanvas(src.size(), CV_8UC3, cv::Scalar(255, 255, 255));
-    //cv::polylines(printCanvas, smoothWrapper, true, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
-    //cv::Rect cropRect = cv::boundingRect(smoothContour);
-    //cropRect.x = std::max(0, cropRect.x - 15);
-    //cropRect.y = std::max(0, cropRect.y - 15);
-    //cropRect.width = std::min(printCanvas.cols - cropRect.x, cropRect.width + 30);
-    //cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
-    //cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
+    // ==========================================================
+    // DRAW RED ROTATED BOUNDING BOX
+    // ==========================================================
+    cv::polylines(
+        src,
+        boxWrapper,
+        true,
+        cv::Scalar(0, 0, 255),
+        1,
+        cv::LINE_AA
+    );
 
-    cv::imwrite("Box_Shape_Result.png", src);
-    return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(boxLengthMM, 0, 'f', 2).arg(boxWidthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
+    // ==========================================================
+    // DRAW TRUE OUTSIDE HULL - GREEN
+    //
+    // Previously you were drawing smoothContour.
+    // That is why it appeared inside.
+    // ==========================================================
+    cv::polylines(
+        src,
+        hullWrapper,
+        true,
+        cv::Scalar(0, 255, 0),
+        2,
+        cv::LINE_AA
+    );
+
+    // ==========================================================
+    // CENTER
+    // ==========================================================
+    cv::circle(
+        src,
+        minRect.center,
+        4,
+        cv::Scalar(255, 255, 255),
+        -1,
+        cv::LINE_AA
+    );
+
+    // ==========================================================
+    // TEXT
+    // ==========================================================
+    QString text =
+        QString("Box L: %1mm | W: %2mm")
+        .arg(boxLengthMM, 0, 'f', 2)
+        .arg(boxWidthMM, 0, 'f', 2);
+
+    cv::putText(
+        src,
+        text.toStdString(),
+        cv::Point(15, 35),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.55,
+        cv::Scalar(0, 0, 255),
+        2,
+        cv::LINE_AA
+    );
+
+    cv::imwrite(
+        "Box_Shape_Result.png",
+        src
+    );
+
+    return QString(
+        "Length : %1 mm\n"
+        "Width  : %2 mm\n"
+        "L/W Ratio : %3"
+    )
+    .arg(boxLengthMM, 0, 'f', 2)
+    .arg(boxWidthMM, 0, 'f', 2)
+    .arg(ratio, 0, 'f', 2);
 }
-
-QString CameraWorker::measureMarquise(cv::Mat &src) {
+QString CameraWorker::measureGeneralC(cv::Mat &src) {
     if (src.empty()) return "No Image Data";
     double ppm = getPpm();
     if (src.channels() == 1) {
@@ -1139,217 +1515,942 @@ QString CameraWorker::measureHeart(cv::Mat &src) {
     return QString("Length : %1 mm\nWidth  : %2 mm\nDip    : %3 mm\nL/W Ratio : %4").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(dipDepthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
 }
 
-QString CameraWorker::measurePear(cv::Mat &src) {
-    if (src.empty()) return "No Shape Found";
-    double ppm = getPpm();
-    if (src.channels() == 1) {
-            cv::cvtColor(src, src, cv::COLOR_GRAY2BGR);
+QString CameraWorker::measurePear(cv::Mat &src)
+{
+    if (src.empty())
+        return "No Shape Found";
+
+    // ==========================================================
+    // CALIBRATION
+    // ==========================================================
+    double ppm = 1.0;
+
+    try
+    {
+        ppm = getPpm();
     }
-    cv::Mat gray, blur, thresh;
-    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
-    cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
-    cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+    catch (...)
+    {
+        return "Calibration Error";
+    }
 
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
-    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
+    if (ppm <= 0)
+        ppm = 1.0;
 
+    // ==========================================================
+    // ENSURE BGR IMAGE
+    // ==========================================================
+    if (src.channels() == 1)
+    {
+        cv::cvtColor(src, src, cv::COLOR_GRAY2BGR);
+    }
+
+    // ==========================================================
+    // PREPROCESS IMAGE
+    // ==========================================================
+    cv::Mat gray;
+    cv::Mat blur;
+    cv::Mat thresh;
+
+    cv::cvtColor(
+        src,
+        gray,
+        cv::COLOR_BGR2GRAY
+    );
+
+    cv::GaussianBlur(
+        gray,
+        blur,
+        cv::Size(5, 5),
+        0
+    );
+
+    cv::threshold(
+        blur,
+        thresh,
+        0,
+        255,
+        cv::THRESH_BINARY_INV | cv::THRESH_OTSU
+    );
+
+    // ==========================================================
+    // MORPHOLOGICAL CLOSE
+    // ==========================================================
+    cv::Mat kernel =
+        cv::getStructuringElement(
+            cv::MORPH_ELLIPSE,
+            cv::Size(3, 3)
+        );
+
+    cv::morphologyEx(
+        thresh,
+        thresh,
+        cv::MORPH_CLOSE,
+        kernel
+    );
+
+    // ==========================================================
+    // FIND RAW CONTOURS
+    //
+    // CHAIN_APPROX_NONE = OpenCvSharp ApproxNone
+    // Keeps every boundary pixel.
+    // ==========================================================
     std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
-    if (contours.empty()) return "No Shape Found";
 
-    auto largestContour = *std::max_element(contours.begin(), contours.end(),
-        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
+    cv::findContours(
+        thresh,
+        contours,
+        cv::RETR_EXTERNAL,
+        cv::CHAIN_APPROX_NONE
+    );
 
-    std::vector<cv::Point> hull;
-    cv::convexHull(largestContour, hull);
+    if (contours.empty())
+        return "No Shape Found";
 
-    cv::Moments mu = cv::moments(hull);
-    cv::Point centroid(mu.m10 / mu.m00, mu.m01 / mu.m00);
+    // ==========================================================
+    // FIND LARGEST RAW CONTOUR
+    // ==========================================================
+    auto rawContour =
+        *std::max_element(
+            contours.begin(),
+            contours.end(),
+            [](const std::vector<cv::Point>& a,
+               const std::vector<cv::Point>& b)
+            {
+                return cv::contourArea(a) <
+                       cv::contourArea(b);
+            }
+        );
 
-    cv::Point pearTip = hull[0];
-    double maxDistToCentroid = 0;
-    for (const auto& p : hull) {
-        double dist = std::hypot(p.x - centroid.x, p.y - centroid.y);
-        if (dist > maxDistToCentroid) { maxDistToCentroid = dist; pearTip = p; }
-    }
+    if (rawContour.empty())
+        return "No Shape Found";
 
-    double dirX = centroid.x - pearTip.x;
-    double dirY = centroid.y - pearTip.y;
-    double lenVector = std::hypot(dirX, dirY);
-    dirX /= (lenVector == 0 ? 1 : lenVector);
-    dirY /= (lenVector == 0 ? 1 : lenVector);
+    // ==========================================================
+    // CALCULATE CENTROID FROM RAW CONTOUR
+    // ==========================================================
+    cv::Moments mu =
+        cv::moments(rawContour);
 
-    cv::Point pearBase = centroid;
-    double maxBaseProjection = 0;
-    for (const auto& p : hull) {
-        double projection = (p.x - pearTip.x) * dirX + (p.y - pearTip.y) * dirY;
-        if (projection > maxBaseProjection) {
-            maxBaseProjection = projection;
-            pearBase = cv::Point(pearTip.x + (int)(dirX * projection), pearTip.y + (int)(dirY * projection));
+    if (std::abs(mu.m00) < 1e-9)
+        return "Invalid Shape";
+
+    cv::Point centroid(
+        static_cast<int>(mu.m10 / mu.m00),
+        static_cast<int>(mu.m01 / mu.m00)
+    );
+
+    // ==========================================================
+    // 1. FIND PEAR TIP
+    //
+    // Furthest raw boundary pixel from centroid.
+    // ==========================================================
+    cv::Point pearTip =
+        rawContour[0];
+
+    double maxDistToCentroid = 0.0;
+
+    for (const cv::Point& p : rawContour)
+    {
+        double dx =
+            p.x - centroid.x;
+
+        double dy =
+            p.y - centroid.y;
+
+        double dist =
+            std::sqrt(
+                dx * dx +
+                dy * dy
+            );
+
+        if (dist > maxDistToCentroid)
+        {
+            maxDistToCentroid = dist;
+            pearTip = p;
         }
     }
 
-    double maxWidthDist = 0;
-    cv::Point widthL(0, 0), widthR(0, 0);
-    for (size_t i = 0; i < hull.size(); i++) {
-        for (size_t j = i + 1; j < hull.size(); j++) {
-            double sX = hull[j].x - hull[i].x;
-            double sY = hull[j].y - hull[i].y;
-            double perpDistance = std::abs(sX * dirY - sY * dirX);
-            if (perpDistance > maxWidthDist) { maxWidthDist = perpDistance; widthL = hull[i]; widthR = hull[j]; }
+    // ==========================================================
+    // CENTRAL AXIS
+    //
+    // Tip -> Centroid
+    // ==========================================================
+    double dirX =
+        centroid.x - pearTip.x;
+
+    double dirY =
+        centroid.y - pearTip.y;
+
+    double lenVector =
+        std::sqrt(
+            dirX * dirX +
+            dirY * dirY
+        );
+
+    double divisor =
+        (lenVector == 0.0)
+        ? 1.0
+        : lenVector;
+
+    dirX /= divisor;
+    dirY /= divisor;
+
+    // ==========================================================
+    // 2. FIND PEAR BASE
+    //
+    // Maximum projection along the center axis.
+    // ==========================================================
+    cv::Point pearBase =
+        centroid;
+
+    double maxBaseProjection = 0.0;
+
+    for (const cv::Point& p : rawContour)
+    {
+        double vX =
+            p.x - pearTip.x;
+
+        double vY =
+            p.y - pearTip.y;
+
+        double projection =
+            vX * dirX +
+            vY * dirY;
+
+        if (projection > maxBaseProjection)
+        {
+            maxBaseProjection =
+                projection;
+
+            // Same behavior as C#:
+            //
+            // pearTip.X +
+            // (int)(dirX * projection)
+            //
+            // Cast happens before addition.
+            pearBase = cv::Point(
+                pearTip.x +
+                static_cast<int>(
+                    dirX * projection
+                ),
+
+                pearTip.y +
+                static_cast<int>(
+                    dirY * projection
+                )
+            );
         }
     }
 
-    double lengthMM = applyVariation(maxBaseProjection / ppm, true);
-    double widthMM = applyVariation(maxWidthDist / ppm, false);
-    double ratio = (widthMM == 0) ? 0 : lengthMM / widthMM;
+    // ==========================================================
+    // 3. FIND MAXIMUM WIDTH
+    //
+    // Perpendicular to center axis.
+    // Uses exact raw contour just like C#.
+    // ==========================================================
+    double maxWidthDist = 0.0;
 
-    cv::line(src, pearTip, pearBase, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
-    cv::line(src, widthL, widthR, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
-    cv::circle(src, centroid, 5, cv::Scalar(0, 165, 255), -1, cv::LINE_AA);
-    std::vector<std::vector<cv::Point>> hullWrapper = { hull };
-    cv::polylines(src, hullWrapper, true, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+    cv::Point widthL(0, 0);
+    cv::Point widthR(0, 0);
 
-    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), cv::Point(centroid.x + 25, centroid.y - 20), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
-    cv::putText(src, QString("W: %1mm").arg(widthMM, 0, 'f', 2).toStdString(), cv::Point(widthL.x + 15, widthL.y + 25), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+    for (size_t i = 0;
+         i < rawContour.size();
+         ++i)
+    {
+        for (size_t j = i + 1;
+             j < rawContour.size();
+             ++j)
+        {
+            double sX =
+                rawContour[j].x -
+                rawContour[i].x;
 
-    //cv::Mat printCanvas(src.size(), CV_8UC3, cv::Scalar(255, 255, 255));
-    //cv::polylines(printCanvas, hullWrapper, true, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
-    //cv::Rect cropRect = cv::boundingRect(hull);
-    //cropRect.x = std::max(0, cropRect.x - 15);
-    //cropRect.y = std::max(0, cropRect.y - 15);
-    //cropRect.width = std::min(printCanvas.cols - cropRect.x, cropRect.width + 30);
-    //cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
-    //cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
+            double sY =
+                rawContour[j].y -
+                rawContour[i].y;
 
-    cv::imwrite("Pear_Result.png", src);
-    return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
+            double perpDistance =
+                std::abs(
+                    sX * dirY -
+                    sY * dirX
+                );
+
+            if (perpDistance >
+                maxWidthDist)
+            {
+                maxWidthDist =
+                    perpDistance;
+
+                widthL =
+                    rawContour[i];
+
+                widthR =
+                    rawContour[j];
+            }
+        }
+    }
+
+    // ==========================================================
+    // PIXELS -> MM
+    // ==========================================================
+    double lengthMM =
+        maxBaseProjection / ppm;
+
+    double widthMM =
+        maxWidthDist / ppm;
+
+    // IMPORTANT:
+    // Calculate ratio BEFORE ApplyVariation
+    // to exactly match C# behavior.
+    double ratio =
+        (widthMM == 0.0)
+        ? 0.0
+        : lengthMM / widthMM;
+
+    // ==========================================================
+    // APPLY VARIATION
+    // ==========================================================
+    lengthMM =
+        applyVariation(
+            lengthMM,
+            true
+        );
+
+    widthMM =
+        applyVariation(
+            widthMM,
+            false
+        );
+
+    // ==========================================================
+    // DRAW LENGTH LINE
+    // RED
+    // ==========================================================
+    cv::line(
+        src,
+        pearTip,
+        pearBase,
+        cv::Scalar(0, 0, 255),
+        1,
+        cv::LINE_AA
+    );
+
+    // ==========================================================
+    // DRAW WIDTH LINE
+    // YELLOW
+    // ==========================================================
+    cv::line(
+        src,
+        widthL,
+        widthR,
+        cv::Scalar(0, 255, 255),
+        1,
+        cv::LINE_AA
+    );
+
+    // ==========================================================
+    // DRAW CENTROID
+    // ORANGE
+    // ==========================================================
+    cv::circle(
+        src,
+        centroid,
+        5,
+        cv::Scalar(0, 165, 255),
+        -1,
+        cv::LINE_AA
+    );
+
+    // ==========================================================
+    // DRAW EXACT RAW CONTOUR
+    // GREEN
+    //
+    // No convex hull.
+    // No approxPolyDP.
+    // ==========================================================
+    std::vector<std::vector<cv::Point>>
+        contourWrapper =
+        {
+            rawContour
+        };
+
+    cv::polylines(
+        src,
+        contourWrapper,
+        true,
+        cv::Scalar(0, 255, 0),
+        2,
+        cv::LINE_AA
+    );
+
+    // ==========================================================
+    // LENGTH TEXT
+    // CYAN
+    // ==========================================================
+    cv::Point lengthTextPoint(
+        centroid.x + 25,
+        centroid.y - 20
+    );
+
+    cv::putText(
+        src,
+        QString("L: %1mm")
+            .arg(
+                lengthMM,
+                0,
+                'f',
+                2
+            )
+            .toStdString(),
+        lengthTextPoint,
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.55,
+        cv::Scalar(255, 255, 0),
+        2,
+        cv::LINE_AA
+    );
+
+    // ==========================================================
+    // WIDTH TEXT
+    // YELLOW
+    // ==========================================================
+    cv::Point widthTextPoint(
+        widthL.x + 15,
+        widthL.y + 25
+    );
+
+    cv::putText(
+        src,
+        QString("W: %1mm")
+            .arg(
+                widthMM,
+                0,
+                'f',
+                2
+            )
+            .toStdString(),
+        widthTextPoint,
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.55,
+        cv::Scalar(0, 255, 255),
+        2,
+        cv::LINE_AA
+    );
+
+    // ==========================================================
+    // CREATE ISOLATED SHAPE IMAGE FOR LABEL PRINTING
+    // ==========================================================
+    
+
+    // ==========================================================
+    // SAVE MAIN RESULT
+    // ==========================================================
+    cv::imwrite(
+        "Pear_Result.png",
+        src
+    );
+
+    // ==========================================================
+    // RETURN RESULT
+    // ==========================================================
+    return QString(
+        "Length : %1 mm\n"
+        "Width  : %2 mm\n"
+        "L/W Ratio : %3"
+    )
+    .arg(lengthMM, 0, 'f', 2)
+    .arg(widthMM, 0, 'f', 2)
+    .arg(ratio, 0, 'f', 2);
 }
 
-QString CameraWorker::measureOval(cv::Mat &src) {
+QString CameraWorker::measureOval(cv::Mat &src)
+{
     qDebug() << "DEBUG: [measureOval] Started.";
-    if (src.empty()) {
+
+    if (src.empty())
+    {
         qDebug() << "DEBUG: [measureOval] src is empty!";
         return "No Shape Found";
     }
 
-    double ppm = getPpm();
-    if (src.channels() == 1) {
-        cv::cvtColor(src, src, cv::COLOR_GRAY2BGR);
-        qDebug() << "DEBUG: [measureOval] Converted 1-channel src to BGR.";
+    // ==========================================================
+    // CALIBRATION
+    // ==========================================================
+    double ppm = 1.0;
+
+    try
+    {
+        ppm = getPpm();
+    }
+    catch (...)
+    {
+        return "Calibration Error";
     }
 
-    cv::Mat gray, blur, diff, thresh;
-    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
-    cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
+    if (ppm <= 0)
+        ppm = 1.0;
 
-    if (!m_backgroundGray.empty()) {
-        cv::absdiff(m_backgroundGray, blur, diff);
-        cv::threshold(diff, thresh, m_thresholdValue, 255, cv::THRESH_BINARY);
-        qDebug() << "DEBUG: [measureOval] Applied background subtraction threshold.";
-    } else {
-        cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
-        qDebug() << "DEBUG: [measureOval] Fallback to Otsu threshold.";
+    // ==========================================================
+    // ENSURE BGR IMAGE
+    // ==========================================================
+    if (src.channels() == 1)
+    {
+        cv::cvtColor(
+            src,
+            src,
+            cv::COLOR_GRAY2BGR
+        );
+
+        qDebug()
+            << "DEBUG: [measureOval] Converted grayscale to BGR.";
     }
 
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
-    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
-    cv::morphologyEx(thresh, thresh, cv::MORPH_OPEN, kernel);
+    // ==========================================================
+    // IMAGE PREPROCESSING
+    // ==========================================================
+    cv::Mat gray;
+    cv::Mat blur;
+    cv::Mat thresh;
 
+    cv::cvtColor(
+        src,
+        gray,
+        cv::COLOR_BGR2GRAY
+    );
+
+    cv::GaussianBlur(
+        gray,
+        blur,
+        cv::Size(5, 5),
+        0
+    );
+
+    // ==========================================================
+    // OTSU THRESHOLD
+    //
+    // Match C# exactly:
+    // Do NOT use background subtraction here.
+    // ==========================================================
+    cv::threshold(
+        blur,
+        thresh,
+        0,
+        255,
+        cv::THRESH_BINARY_INV |
+        cv::THRESH_OTSU
+    );
+
+    qDebug()
+        << "DEBUG: [measureOval] Applied Otsu threshold.";
+
+    // ==========================================================
+    // MORPHOLOGY
+    //
+    // C# uses CLOSE only.
+    // Do NOT apply MORPH_OPEN.
+    // ==========================================================
+    cv::Mat kernel =
+        cv::getStructuringElement(
+            cv::MORPH_ELLIPSE,
+            cv::Size(3, 3)
+        );
+
+    cv::morphologyEx(
+        thresh,
+        thresh,
+        cv::MORPH_CLOSE,
+        kernel
+    );
+
+    // ==========================================================
+    // FIND CONTOURS
+    // ApproxNone == CHAIN_APPROX_NONE
+    // ==========================================================
     std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
-    qDebug() << "DEBUG: [measureOval] findContours found:" << contours.size() << "contours.";
 
-    if (contours.empty()) return "No Shape Found";
+    cv::findContours(
+        thresh,
+        contours,
+        cv::RETR_EXTERNAL,
+        cv::CHAIN_APPROX_NONE
+    );
 
-    std::vector<cv::Point> bestContour;
-    double maxArea = 0;
+    qDebug()
+        << "DEBUG: [measureOval] findContours found:"
+        << contours.size()
+        << "contours.";
 
-    for (const auto& c : contours) {
-        double area = cv::contourArea(c);
-        cv::Rect rect = cv::boundingRect(c);
+    if (contours.empty())
+        return "No Shape Found";
 
-        bool touchesBorder = (rect.x <= 2 || rect.y <= 2 ||
-                              rect.x + rect.width >= src.cols - 2 ||
-                              rect.y + rect.height >= src.rows - 2);
+    // ==========================================================
+    // FIND LARGEST CONTOUR
+    //
+    // Match C#:
+    // No border rejection.
+    // No minimum 500 area filter.
+    // ==========================================================
+    auto largestContour =
+        *std::max_element(
+            contours.begin(),
+            contours.end(),
+            [](const std::vector<cv::Point>& a,
+               const std::vector<cv::Point>& b)
+            {
+                return cv::contourArea(a)
+                     < cv::contourArea(b);
+            }
+        );
 
-        // Print details of larger contours to track if they are being rejected
-        if (area > 200) {
-             qDebug() << "DEBUG: [measureOval] Inspecting contour -> Area:" << area << "Touches Border:" << touchesBorder;
-        }
+    if (largestContour.empty())
+        return "No Shape Found";
 
-        if (!touchesBorder && area > maxArea && area > 500) {
-            maxArea = area;
-            bestContour = c;
-        }
-    }
-
-    qDebug() << "DEBUG: [measureOval] maxArea after border filtering:" << maxArea;
-
-    if (bestContour.empty()) {
-        qDebug() << "DEBUG: [measureOval] bestContour is empty. Returning 'No Valid Object Found'.";
-        return "No Valid Object Found";
-    }
-
+    // ==========================================================
+    // CONVEX HULL
+    // ==========================================================
     std::vector<cv::Point> hull;
-    cv::convexHull(bestContour, hull);
 
-    cv::Point lenStart(0, 0), lenEnd(0, 0);
-    double maxLenDist = 0;
-    for (size_t i = 0; i < hull.size(); i++) {
-        for (size_t j = i + 1; j < hull.size(); j++) {
-            double d = std::hypot(hull[i].x - hull[j].x, hull[i].y - hull[j].y);
-            if (d > maxLenDist) {
-                maxLenDist = d;
-                lenStart = hull[i];
-                lenEnd = hull[j];
-            }
-        }
+    cv::convexHull(
+        largestContour,
+        hull
+    );
+
+    if (hull.empty())
+        return "No Shape Found";
+
+    // ==========================================================
+    // MINIMUM AREA ROTATED RECTANGLE
+    //
+    // This is the major correction.
+    // Same as C#:
+    //
+    // RotatedRect minRect = Cv2.MinAreaRect(hull);
+    // ==========================================================
+    cv::RotatedRect minRect =
+        cv::minAreaRect(hull);
+
+    // ==========================================================
+    // LENGTH / WIDTH
+    // ==========================================================
+    double lengthPx =
+        std::max(
+            static_cast<double>(minRect.size.width),
+            static_cast<double>(minRect.size.height)
+        );
+
+    double widthPx =
+        std::min(
+            static_cast<double>(minRect.size.width),
+            static_cast<double>(minRect.size.height)
+        );
+
+    // ==========================================================
+    // PIXELS -> MM
+    //
+    // Match C# exactly:
+    // ratio BEFORE applyVariation()
+    // ==========================================================
+    double lengthMM =
+        lengthPx / ppm;
+
+    double widthMM =
+        widthPx / ppm;
+
+    double ratio =
+        (widthMM == 0.0)
+        ? 0.0
+        : lengthMM / widthMM;
+
+    // ==========================================================
+    // APPLY VARIATION
+    // ==========================================================
+    lengthMM =
+        applyVariation(
+            lengthMM,
+            true
+        );
+
+    widthMM =
+        applyVariation(
+            widthMM,
+            false
+        );
+
+    // ==========================================================
+    // GET 4 ROTATED RECTANGLE CORNERS
+    // ==========================================================
+    cv::Point2f rectPoints[4];
+
+    minRect.points(rectPoints);
+
+    cv::Point2f p0 = rectPoints[0];
+    cv::Point2f p1 = rectPoints[1];
+    cv::Point2f p2 = rectPoints[2];
+    cv::Point2f p3 = rectPoints[3];
+
+    // ==========================================================
+    // MIDPOINTS OF EACH RECTANGLE SIDE
+    //
+    // Same concept as C#.
+    // ==========================================================
+    cv::Point pt01(
+        static_cast<int>(
+            std::round(
+                (p0.x + p1.x) / 2.0
+            )
+        ),
+        static_cast<int>(
+            std::round(
+                (p0.y + p1.y) / 2.0
+            )
+        )
+    );
+
+    cv::Point pt12(
+        static_cast<int>(
+            std::round(
+                (p1.x + p2.x) / 2.0
+            )
+        ),
+        static_cast<int>(
+            std::round(
+                (p1.y + p2.y) / 2.0
+            )
+        )
+    );
+
+    cv::Point pt23(
+        static_cast<int>(
+            std::round(
+                (p2.x + p3.x) / 2.0
+            )
+        ),
+        static_cast<int>(
+            std::round(
+                (p2.y + p3.y) / 2.0
+            )
+        )
+    );
+
+    cv::Point pt30(
+        static_cast<int>(
+            std::round(
+                (p3.x + p0.x) / 2.0
+            )
+        ),
+        static_cast<int>(
+            std::round(
+                (p3.y + p0.y) / 2.0
+            )
+        )
+    );
+
+    // ==========================================================
+    // DISTANCE BETWEEN OPPOSITE SIDE MIDPOINTS
+    // ==========================================================
+    double dist01_23 =
+        std::sqrt(
+            std::pow(
+                pt01.x - pt23.x,
+                2.0
+            ) +
+            std::pow(
+                pt01.y - pt23.y,
+                2.0
+            )
+        );
+
+    double dist12_30 =
+        std::sqrt(
+            std::pow(
+                pt12.x - pt30.x,
+                2.0
+            ) +
+            std::pow(
+                pt12.y - pt30.y,
+                2.0
+            )
+        );
+
+    // ==========================================================
+    // ASSIGN LENGTH AND WIDTH AXES
+    // ==========================================================
+    cv::Point lenStart;
+    cv::Point lenEnd;
+
+    cv::Point widStart;
+    cv::Point widEnd;
+
+    if (dist01_23 > dist12_30)
+    {
+        lenStart = pt01;
+        lenEnd   = pt23;
+
+        widStart = pt12;
+        widEnd   = pt30;
+    }
+    else
+    {
+        lenStart = pt12;
+        lenEnd   = pt30;
+
+        widStart = pt01;
+        widEnd   = pt23;
     }
 
-    double maxWidthDist = 0;
-    cv::Point widStart(0, 0), widEnd(0, 0);
-    double axisX = lenEnd.x - lenStart.x;
-    double axisY = lenEnd.y - lenStart.y;
-    double axisLength = std::hypot(axisX, axisY);
+    // ==========================================================
+    // CENTER
+    // ==========================================================
+    cv::Point center(
+        static_cast<int>(
+            std::round(
+                minRect.center.x
+            )
+        ),
+        static_cast<int>(
+            std::round(
+                minRect.center.y
+            )
+        )
+    );
 
-    for (size_t i = 0; i < hull.size(); i++) {
-        for (size_t j = i + 1; j < hull.size(); j++) {
-            double sX = hull[j].x - hull[i].x;
-            double sY = hull[j].y - hull[i].y;
-            double crossProduct = std::abs(sX * axisY - sY * axisX) / (axisLength == 0 ? 1 : axisLength);
+    qDebug()
+        << "DEBUG: [measureOval] Drawing lines..."
+        << "L:" << lengthMM
+        << "W:" << widthMM
+        << "Ratio:" << ratio;
 
-            if (crossProduct > maxWidthDist) {
-                maxWidthDist = crossProduct;
-                widStart = hull[i];
-                widEnd = hull[j];
-            }
-        }
-    }
+    // ==========================================================
+    // DRAW LENGTH LINE - RED
+    // ==========================================================
+    cv::line(
+        src,
+        lenStart,
+        lenEnd,
+        cv::Scalar(0, 0, 255),
+        1,
+        cv::LINE_AA
+    );
 
-    double lengthMM = applyVariation(maxLenDist / ppm, true);
-    double widthMM = applyVariation(maxWidthDist / ppm, false);
-    double ratio = (widthMM == 0) ? 0 : lengthMM / widthMM;
-    cv::Point center((lenStart.x + lenEnd.x) / 2, (lenStart.y + lenEnd.y) / 2);
+    // ==========================================================
+    // DRAW WIDTH LINE - YELLOW
+    // ==========================================================
+    cv::line(
+        src,
+        widStart,
+        widEnd,
+        cv::Scalar(0, 255, 255),
+        1,
+        cv::LINE_AA
+    );
 
-    qDebug() << "DEBUG: [measureOval] Drawing lines... L:" << lengthMM << "W:" << widthMM;
+    // ==========================================================
+    // DRAW CENTER - ORANGE
+    // ==========================================================
+    cv::circle(
+        src,
+        center,
+        5,
+        cv::Scalar(0, 165, 255),
+        -1,
+        cv::LINE_AA
+    );
 
-    cv::line(src, lenStart, lenEnd, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
-    cv::line(src, widStart, widEnd, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
-    cv::circle(src, center, 5, cv::Scalar(0, 165, 255), -1, cv::LINE_AA);
+    // ==========================================================
+    // DRAW HULL - GREEN
+    // ==========================================================
+    std::vector<std::vector<cv::Point>>
+        hullWrapper =
+        {
+            hull
+        };
 
-    std::vector<std::vector<cv::Point>> hullWrapper = { hull };
-    cv::polylines(src, hullWrapper, true, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+    cv::polylines(
+        src,
+        hullWrapper,
+        true,
+        cv::Scalar(0, 255, 0),
+        2,
+        cv::LINE_AA
+    );
 
-    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), cv::Point(center.x + 25, center.y - 20), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
-    cv::putText(src, QString("W: %1mm").arg(widthMM, 0, 'f', 2).toStdString(), cv::Point(widStart.x + 15, widStart.y + 25), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+    // ==========================================================
+    // LENGTH TEXT - CYAN
+    // ==========================================================
+    cv::putText(
+        src,
+        QString("L: %1mm")
+            .arg(
+                lengthMM,
+                0,
+                'f',
+                2
+            )
+            .toStdString(),
 
-    cv::imwrite("ovel_Result.png", src);
-    qDebug() << "DEBUG: [measureOval] Finished writing ovel_Result.png and returning string.";
+        cv::Point(
+            center.x + 25,
+            center.y - 20
+        ),
 
-    return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.55,
+        cv::Scalar(255, 255, 0),
+        2,
+        cv::LINE_AA
+    );
+
+    // ==========================================================
+    // WIDTH TEXT - YELLOW
+    // ==========================================================
+    cv::putText(
+        src,
+        QString("W: %1mm")
+            .arg(
+                widthMM,
+                0,
+                'f',
+                2
+            )
+            .toStdString(),
+
+        cv::Point(
+            widStart.x + 15,
+            widStart.y + 25
+        ),
+
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.55,
+        cv::Scalar(0, 255, 255),
+        2,
+        cv::LINE_AA
+    );
+
+    
+
+    // ==========================================================
+    // SAVE RESULT
+    // ==========================================================
+    cv::imwrite(
+        "ovel_Result.png",
+        src
+    );
+
+    qDebug()
+        << "DEBUG: [measureOval] Finished.";
+
+    // ==========================================================
+    // RETURN
+    // ==========================================================
+    return QString(
+        "Length : %1 mm\n"
+        "Width  : %2 mm\n"
+        "L/W Ratio : %3"
+    )
+    .arg(lengthMM, 0, 'f', 2)
+    .arg(widthMM, 0, 'f', 2)
+    .arg(ratio, 0, 'f', 2);
 }
-
 /*QString CameraWorker::measureOval(cv::Mat &src) {
     if (src.empty()) return "No Shape Found";
     double ppm = getPpm();
@@ -1705,9 +2806,90 @@ cv::Point2f CameraWorker::snapToEdgeStraight(cv::Point2f center, cv::Point2f tar
     return targetPt;
 }
 
-QString CameraWorker::measureGeneralC(cv::Mat &src) {
-    return measureMarquise(src);
+QString CameraWorker::measureMarquise(cv::Mat &src) {
+    if (src.empty()) return "No Image Data";
+    double ppm = getPpm();
+    if (src.channels() == 1) {
+            cv::cvtColor(src, src, cv::COLOR_GRAY2BGR);
+    }
+    cv::Mat gray, blur, thresh;
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
+    cv::threshold(blur, thresh, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    cv::morphologyEx(thresh, thresh, cv::MORPH_CLOSE, kernel);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    if (contours.empty()) return "No Shape Found";
+
+    auto largestContour = *std::max_element(contours.begin(), contours.end(),
+        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) { return cv::contourArea(a) < cv::contourArea(b); });
+
+    std::vector<cv::Point> hull;
+    cv::convexHull(largestContour, hull);
+
+    std::vector<cv::Point> smoothContour;
+    double epsilon = 0.01 * cv::arcLength(hull, true);
+    cv::approxPolyDP(hull, smoothContour, epsilon, true);
+
+    cv::Point tip1(0, 0), tip2(0, 0);
+    double maxTipDist = 0;
+    for (size_t i = 0; i < smoothContour.size(); i++) {
+        for (size_t j = i + 1; j < smoothContour.size(); j++) {
+            double d = std::hypot(smoothContour[i].x - smoothContour[j].x, smoothContour[i].y - smoothContour[j].y);
+            if (d > maxTipDist) { maxTipDist = d; tip1 = smoothContour[i]; tip2 = smoothContour[j]; }
+        }
+    }
+
+    double maxWidthDist = 0;
+    cv::Point widthPoint1(0, 0), widthPoint2(0, 0);
+    double axisX = tip2.x - tip1.x;
+    double axisY = tip2.y - tip1.y;
+    double axisLength = std::hypot(axisX, axisY);
+
+    for (size_t i = 0; i < smoothContour.size(); i++) {
+        for (size_t j = i + 1; j < smoothContour.size(); j++) {
+            double sX = smoothContour[j].x - smoothContour[i].x;
+            double sY = smoothContour[j].y - smoothContour[i].y;
+            double crossProduct = std::abs(sX * axisY - sY * axisX) / (axisLength == 0 ? 1 : axisLength);
+            if (crossProduct > maxWidthDist) {
+                maxWidthDist = crossProduct;
+                widthPoint1 = smoothContour[i];
+                widthPoint2 = smoothContour[j];
+            }
+        }
+    }
+
+    double lengthMM = applyVariation(maxTipDist / ppm, true);
+    double widthMM = applyVariation(maxWidthDist / ppm, false);
+    double ratio = (widthMM == 0) ? 0 : lengthMM / widthMM;
+
+    cv::line(src, tip1, tip2, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
+    cv::line(src, widthPoint1, widthPoint2, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+    std::vector<std::vector<cv::Point>> wrapper = { smoothContour };
+    cv::polylines(src, wrapper, true, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+
+    cv::Point lenMid((tip1.x + tip2.x) / 2 + 20, (tip1.y + tip2.y) / 2 - 15);
+    cv::Point widMid((widthPoint1.x + widthPoint2.x) / 2 - 80, (widthPoint1.y + widthPoint2.y) / 2 + 25);
+
+    cv::putText(src, QString("L: %1mm").arg(lengthMM, 0, 'f', 2).toStdString(), lenMid, cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+    cv::putText(src, QString("W: %1mm").arg(widthMM, 0, 'f', 2).toStdString(), widMid, cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+
+    //cv::Mat printCanvas(src.size(), CV_8UC3, cv::Scalar(255, 255, 255));
+    //cv::polylines(printCanvas, wrapper, true, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
+    //cv::Rect cropRect = cv::boundingRect(smoothContour);
+    //cropRect.x = std::max(0, cropRect.x - 15);
+    //cropRect.y = std::max(0, cropRect.y - 15);
+    //cropRect.width = std::min(printCanvas.cols - cropRect.x, cropRect.width + 30);
+    //cropRect.height = std::min(printCanvas.rows - cropRect.y, cropRect.height + 30);
+    //cv::imwrite("ShapeForLabel.png", printCanvas(cropRect));
+
+    cv::imwrite("GeneralC_Result.png", src);
+    return QString("Length : %1 mm\nWidth  : %2 mm\nL/W Ratio : %3").arg(lengthMM, 0, 'f', 2).arg(widthMM, 0, 'f', 2).arg(ratio, 0, 'f', 2);
 }
+
 
 QString CameraWorker::measureRound(cv::Mat &src) {
     qDebug() << "DEBUG: [measureRound] Started.";
